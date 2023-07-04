@@ -1046,7 +1046,7 @@ H.setup_config = function(config)
     ['options.permanent_delete'] = { config.options.permanent_delete, 'boolean' },
 
     ['windows.max_number'] = { config.windows.max_number, 'number' },
-    ['windows.preview'] = { config.windows.preview, 'boolean' },
+    ['windows.preview'] = { config.windows.preview, { 'boolean', 'function' } },
     ['windows.width_focus'] = { config.windows.width_focus, 'number' },
     ['windows.width_nofocus'] = { config.windows.width_nofocus, 'number' },
     ['windows.width_preview'] = { config.windows.width_preview, 'number' },
@@ -1293,7 +1293,9 @@ H.explorer_sync_cursor_and_branch = function(explorer, depth)
   explorer.depth_focus = math.min(explorer.depth_focus, #explorer.branch)
 
   -- Show preview to the right of current buffer if needed
-  local show_preview = explorer.opts.windows.preview
+  local show_preview = type(explorer.opts.windows.preview) == 'function' and
+                       explorer.opts.windows.preview(cursor_path) or
+                       explorer.opts.windows.preview == true
   local is_cur_buf = buf_id == vim.api.nvim_get_current_buf()
   if show_preview and is_cur_buf then table.insert(explorer.branch, cursor_path) end
 
