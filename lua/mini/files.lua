@@ -157,6 +157,8 @@
 ---  |-------------|------|------------------------------------------------|
 ---  | Reset       | <BS> | Reset current explorer                         |
 ---  |-------------|------|------------------------------------------------|
+---  | Reveal cwd  |  @   | Reset current current working directory        |
+---  |-------------|------|------------------------------------------------|
 ---  | Show help   |  g?  | Show help window                               |
 ---  |-------------|------|------------------------------------------------|
 ---  | Synchronize |  =   | Synchronize user edits and/or external changes |
@@ -179,6 +181,9 @@
 ---
 --- - "Reset" focuses only on "anchor" directory (the one used to open current
 ---   explorer) and resets all stored directory cursor positions.
+---
+--- - "Reveal cwd" extends branch to include |current-directory|.
+---   If it is not an ancestor of the current branch, nothing is done.
 ---
 --- - "Show help" results into new window with helpful information about current
 ---   explorer. Press `q` to close it.
@@ -589,6 +594,7 @@ MiniFiles.config = {
     go_out      = 'h',
     go_out_plus = 'H',
     reset       = '<BS>',
+    reveal_cwd  = '@',
     show_help   = 'g?',
     synchronize = '=',
     trim_left   = '<',
@@ -848,6 +854,32 @@ MiniFiles.trim_right = function()
   H.explorer_refresh(explorer)
 end
 
+--- Reveal current working directory
+---
+--- - Prepend branch with parent paths until current working directory is reached.
+---   Do nothing if not inside it.
+MiniFiles.reveal_cwd = function()
+  local explorer = H.explorer_get()
+  if explorer == nil then return end
+
+  local cwd = H.fs_full_path(vim.fn.getcwd())
+  local cwd_ancestor_pattern = string.format('^%s/.', vim.pesc(cwd))
+  while explorer.branch[1]:find(cwd_ancestor_pattern) ~= nil do
+    -- Add parent to branch
+    local parent, name = H.fs_get_parent(explorer.branch[1]), H.fs_get_basename(explorer.branch[1])
+    table.insert(explorer.branch, 1, parent)
+
+    explorer.depth_focus = explorer.depth_focus + 1
+
+    -- Set cursor on child entry
+    local parent_view = explorer.views[parent] or {}
+    parent_view.cursor = name
+    explorer.views[parent] = parent_view
+  end
+
+  H.explorer_refresh(explorer)
+end
+
 --- Show help window
 ---
 --- - Open window with helpful information about currently shown explorer and
@@ -1037,6 +1069,7 @@ H.setup_config = function(config)
     ['mappings.go_out'] = { config.mappings.go_out, 'string' },
     ['mappings.go_out_plus'] = { config.mappings.go_out_plus, 'string' },
     ['mappings.reset'] = { config.mappings.reset, 'string' },
+    ['mappings.reveal_cwd'] = { config.mappings.reveal_cwd, 'string' },
     ['mappings.show_help'] = { config.mappings.show_help, 'string' },
     ['mappings.synchronize'] = { config.mappings.synchronize, 'string' },
     ['mappings.trim_left'] = { config.mappings.trim_left, 'string' },
@@ -1296,8 +1329,9 @@ H.explorer_sync_cursor_and_branch = function(explorer, depth)
   local show_preview = type(explorer.opts.windows.preview) == 'function' and
                        explorer.opts.windows.preview(cursor_path) or
                        explorer.opts.windows.preview == true
+  local path_is_present = type(cursor_path) == 'string' and H.fs_is_present_path(cursor_path)
   local is_cur_buf = buf_id == vim.api.nvim_get_current_buf()
-  if show_preview and is_cur_buf then table.insert(explorer.branch, cursor_path) end
+  if show_preview and path_is_present and is_cur_buf then table.insert(explorer.branch, cursor_path) end
 
   return explorer
 end
@@ -1481,7 +1515,8 @@ H.explorer_open_file = function(explorer, path)
   if path_buf_id ~= nil then
     vim.api.nvim_win_set_buf(explorer.target_window, path_buf_id)
   else
-    vim.fn.win_execute(explorer.target_window, 'edit ' .. vim.fn.fnameescape(path))
+    -- Avoid possible errors with `:edit`, like present swap file
+    pcall(vim.fn.win_execute, explorer.target_window, 'edit ' .. vim.fn.fnameescape(path))
   end
 
   return explorer
@@ -1828,6 +1863,7 @@ H.buffer_make_mappings = function(buf_id, mappings)
   buf_map('n', mappings.go_out,      go_out_with_count,     'Go out of directory')
   buf_map('n', mappings.go_out_plus, go_out_plus,           'Go out of directory plus')
   buf_map('n', mappings.reset,       MiniFiles.reset,       'Reset')
+  buf_map('n', mappings.reveal_cwd,  MiniFiles.reveal_cwd,  'Reveal cwd')
   buf_map('n', mappings.show_help,   MiniFiles.show_help,   'Show Help')
   buf_map('n', mappings.synchronize, MiniFiles.synchronize, 'Synchronize')
   buf_map('n', mappings.trim_left,   MiniFiles.trim_left,   'Trim branch left')
@@ -2383,7 +2419,8 @@ H.fs_move = function(from, to)
   -- Don't override existing path
   if H.fs_is_present_path(to) then return false end
 
-  -- Move
+  -- Move while allowing to create directory
+  vim.fn.mkdir(H.fs_get_parent(to), 'p')
   local success = vim.loop.fs_rename(from, to)
 
   -- Rename in loaded buffers
