@@ -1955,8 +1955,9 @@ H.buffer_update_file = function(buf_id, path, opts)
   -- Add highlighting on Neovim>=0.8 which has stabilized API
   if vim.fn.has('nvim-0.8') == 1 then
     local ft = vim.filetype.match({ buf = buf_id, filename = path })
-    local ok, _ = pcall(vim.treesitter.start, buf_id, ft)
-    if not ok then vim.bo[buf_id].syntax = ft end
+    local has_lang, lang = pcall(vim.treesitter.language.get_lang, ft)
+    local has_ts, _ = pcall(vim.treesitter.start, buf_id, has_lang and lang or ft)
+    if not has_ts then vim.bo[buf_id].syntax = ft end
   end
 
   return {}
@@ -2407,9 +2408,13 @@ H.fs_copy = function(from, to)
   -- Don't override existing path
   if H.fs_is_present_path(to) then return false end
 
-  -- Copy file directly
   local from_type = H.fs_get_type(from)
   if from_type == nil then return false end
+
+  -- Allow copying inside non-existing directory
+  vim.fn.mkdir(H.fs_get_parent(to), 'p')
+
+  -- Copy file directly
   if from_type == 'file' then return vim.loop.fs_copyfile(from, to) end
 
   -- Recursively copy a directory
