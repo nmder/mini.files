@@ -87,6 +87,7 @@
 ---
 --- * `MiniFilesBorder` - border of regular windows.
 --- * `MiniFilesBorderModified` - border of windows showing modified buffer.
+--- * `MiniFilesCursorLine` - cursor line in explorer windows.
 --- * `MiniFilesDirectory` - text and icon representing directory.
 --- * `MiniFilesFile` - text representing file.
 --- * `MiniFilesNormal` - basic foreground/background highlighting.
@@ -531,7 +532,7 @@ end
 ---
 --- `content.sort` describes in which order directory entries should be shown
 --- in directory buffer. Takes as input and returns as output an array of file
---- system entry data. Note: techincally, it can be used to filter and modify
+--- system entry data. Note: technically, it can be used to filter and modify
 --- its elements as well.
 --- Uses |MiniFiles.default_sort()| by default.
 ---
@@ -578,7 +579,9 @@ end
 --- There is no constraint by default.
 ---
 --- `windows.preview` is a boolean indicating whether to show preview of
---- file/directory under cursor.
+--- file/directory under cursor. Note: it is shown with highlighting if Neovim
+--- version is sufficient and file is small enough (less than 1K bytes per line
+--- or 1M bytes in total).
 ---
 --- `windows.width_focus` and `windows.width_nofocus` are number of columns used
 --- as `width` for focused and non-focused windows respectively.
@@ -697,6 +700,9 @@ MiniFiles.open = function(path, use_latest, opts)
 
   -- Register latest used path
   H.latest_paths[vim.api.nvim_get_current_tabpage()] = path
+
+  -- Track lost focus
+  H.explorer_track_lost_focus()
 end
 
 --- Refresh explorer
@@ -769,6 +775,9 @@ end
 MiniFiles.close = function()
   local explorer = H.explorer_get()
   if explorer == nil then return nil end
+
+  -- Stop tracking lost focus
+  pcall(vim.loop.timer_stop, H.timers.focus)
 
   -- Confirm close if there is modified buffer
   if not H.explorer_confirm_modified(explorer, 'close') then return false end
@@ -1018,11 +1027,16 @@ end
 
 -- Helper data ================================================================
 -- Module default config
-H.default_config = MiniFiles.config
+H.default_config = vim.deepcopy(MiniFiles.config)
 
 -- Namespaces
 H.ns_id = {
   highlight = vim.api.nvim_create_namespace('MiniFilesHighlight'),
+}
+
+-- Timers
+H.timers = {
+  focus = vim.loop.new_timer(),
 }
 
 -- Index of all visited files
@@ -1058,7 +1072,7 @@ H.setup_config = function(config)
   -- General idea: if some table elements are not present in user-supplied
   -- `config`, take them from default config
   vim.validate({ config = { config, 'table', true } })
-  config = vim.tbl_deep_extend('force', H.default_config, config or {})
+  config = vim.tbl_deep_extend('force', vim.deepcopy(H.default_config), config or {})
 
   vim.validate({
     content = { config.content, 'table' },
@@ -1127,6 +1141,7 @@ H.create_default_hl = function()
 
   hi('MiniFilesBorder',         { link = 'FloatBorder' })
   hi('MiniFilesBorderModified', { link = 'DiagnosticFloatingWarn' })
+  hi('MiniFilesCursorLine',     { link = 'CursorLine' })
   hi('MiniFilesDirectory',      { link = 'Directory'   })
   hi('MiniFilesFile',           {})
   hi('MiniFilesNormal',         { link = 'NormalFloat' })
@@ -1148,22 +1163,17 @@ end
 
 -- Autocommands ---------------------------------------------------------------
 H.track_dir_edit = function(data)
-  local buf_id = data.buf
-
   -- Make early returns
-  if vim.b[buf_id].minifiles_processed_dir then
-    vim.api.nvim_buf_delete(buf_id, { force = true })
-    return
-  end
+  if vim.api.nvim_get_current_buf() ~= data.buf then return end
 
-  if vim.api.nvim_get_current_buf() ~= buf_id then return end
+  if vim.b.minifiles_processed_dir then return vim.api.nvim_buf_delete(0, { force = true }) end
 
-  local path = vim.api.nvim_buf_get_name(buf_id)
+  local path = vim.api.nvim_buf_get_name(0)
   if vim.fn.isdirectory(path) ~= 1 then return end
 
   -- Make directory buffer disappear when it is not needed
-  vim.bo[buf_id].bufhidden = 'wipe'
-  vim.b[buf_id].minifiles_processed_dir = true
+  vim.bo.bufhidden = 'wipe'
+  vim.b.minifiles_processed_dir = true
 
   -- Open directory without history
   vim.schedule(function() MiniFiles.open(path, false) end)
@@ -1280,6 +1290,17 @@ H.explorer_refresh = function(explorer, opts)
   H.opened_explorers[tabpage_id] = explorer
 
   return explorer
+end
+
+H.explorer_track_lost_focus = function()
+  local track = vim.schedule_wrap(function()
+    local ft = vim.bo.filetype
+    if ft == 'minifiles' or ft == 'minifiles-help' then return end
+    local cur_win_id = vim.api.nvim_get_current_win()
+    MiniFiles.close()
+    pcall(vim.api.nvim_set_current_win, cur_win_id)
+  end)
+  H.timers.focus:start(1000, 1000, track)
 end
 
 H.explorer_normalize = function(explorer)
@@ -1518,14 +1539,17 @@ H.explorer_open_file = function(explorer, path)
   -- `:edit` call and avoids some problems with auto-root from 'mini.misc'.
   local path_buf_id
   for _, buf_id in ipairs(vim.api.nvim_list_bufs()) do
-    if H.is_valid_buf(buf_id) and vim.api.nvim_buf_get_name(buf_id) == path then path_buf_id = buf_id end
+    local is_target = H.is_valid_buf(buf_id) and vim.bo[buf_id].buflisted and vim.api.nvim_buf_get_name(buf_id) == path
+    if is_target then path_buf_id = buf_id end
   end
 
   if path_buf_id ~= nil then
     vim.api.nvim_win_set_buf(explorer.target_window, path_buf_id)
   else
-    -- Avoid possible errors with `:edit`, like present swap file
-    pcall(vim.fn.win_execute, explorer.target_window, 'edit ' .. vim.fn.fnameescape(path))
+    -- Use relative path for a better initial view in `:buffers`
+    local path_norm = vim.fn.fnameescape(vim.fn.fnamemodify(path, ':.'))
+    -- Use `pcall()` to avoid possible `:edit` errors, like present swap file
+    pcall(vim.fn.win_execute, explorer.target_window, 'edit ' .. path_norm)
   end
 
   return explorer
@@ -1630,6 +1654,7 @@ H.explorer_show_help = function(explorer_buf_id, explorer_win_id)
   local win_id = vim.api.nvim_open_win(buf_id, false, config)
   H.window_update_highlight(win_id, 'NormalFloat', 'MiniFilesNormal')
   H.window_update_highlight(win_id, 'FloatTitle', 'MiniFilesTitle')
+  H.window_update_highlight(win_id, 'CursorLine', 'MiniFilesCursorLine')
   vim.wo[win_id].cursorline = true
 
   vim.api.nvim_set_current_win(win_id)
@@ -1952,8 +1977,8 @@ H.buffer_update_file = function(buf_id, path, opts)
   -- Set lines
   H.set_buflines(buf_id, lines)
 
-  -- Add highlighting on Neovim>=0.8 which has stabilized API
-  if vim.fn.has('nvim-0.8') == 1 then
+  -- Add highlighting if reasonable (for performance or functionality reasons)
+  if H.buffer_should_highlight(buf_id) then
     local ft = vim.filetype.match({ buf = buf_id, filename = path })
     local has_lang, lang = pcall(vim.treesitter.language.get_lang, ft)
     local has_ts, _ = pcall(vim.treesitter.start, buf_id, has_lang and lang or ft)
@@ -2003,6 +2028,15 @@ H.buffer_compute_fs_diff = function(buf_id, ref_path_ids)
   return res
 end
 
+H.buffer_should_highlight = function(buf_id)
+  -- Neovim>=0.8 has more stable API
+  if vim.fn.has('nvim-0.8') == 0 then return false end
+
+  -- Highlight if buffer size is not too big, both in total and per line
+  local buf_size = vim.api.nvim_buf_call(buf_id, function() return vim.fn.line2byte(vim.fn.line('$') + 1) end)
+  return buf_size <= 1000000 and buf_size <= 1000 * vim.api.nvim_buf_line_count(buf_id)
+end
+
 H.is_opened_buffer = function(buf_id) return H.opened_buffers[buf_id] ~= nil end
 
 H.is_modified_buffer = function(buf_id)
@@ -2013,7 +2047,7 @@ end
 H.match_line_entry_name = function(l)
   if l == nil then return nil end
   local offset = H.match_line_offset(l)
-  -- Go up until first occurence of path separator allowing to track entries
+  -- Go up until first occurrence of path separator allowing to track entries
   -- like `a/b.lua` when creating nested structure
   local res = l:sub(offset):gsub('/.*$', '')
   return res
@@ -2067,6 +2101,7 @@ H.window_open = function(buf_id, config)
   -- Set permanent window highlights
   H.window_update_highlight(win_id, 'NormalFloat', 'MiniFilesNormal')
   H.window_update_highlight(win_id, 'FloatTitle', 'MiniFilesTitle')
+  H.window_update_highlight(win_id, 'CursorLine', 'MiniFilesCursorLine')
 
   -- Trigger dedicated event
   H.trigger_event('MiniFilesWindowOpen', { buf_id = buf_id, win_id = win_id })
@@ -2105,7 +2140,7 @@ H.window_update = function(win_id, config)
   -- Reset basic highlighting (removes possible "focused" highlight group)
   H.window_update_highlight(win_id, 'FloatTitle', 'MiniFilesTitle')
 
-  -- Make sure that 'cursorline' is not overriden by `config.style`
+  -- Make sure that 'cursorline' is not overridden by `config.style`
   vim.wo[win_id].cursorline = true
 
   -- Make sure proper `conceallevel` (can be not the case with 'noice.nvim')
