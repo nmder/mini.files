@@ -2172,12 +2172,20 @@ H.window_update = function(win_id, config)
     config.title = nil
   end
 
-  config.footer = 'Sort: ' .. ({
-    [MiniFiles.default_sort] = 'Default',
-    [MiniFiles.time_sort] = 'Mod. Time',
-    [MiniFiles.size_sort] = 'Size',
-  })[MiniFiles.config.content.sort]
-  config.footer_pos = 'right'
+  if vim.fn.has('nvim-0.10') == 1 then
+    config.footer = 'Sort: ' .. ({
+      [MiniFiles.default_sort] = 'Default',
+      [MiniFiles.time_sort] = 'Mod. Time',
+      [MiniFiles.size_sort] = 'Size',
+    })[MiniFiles.config.content.sort]
+    config.footer_pos = 'right'
+  else
+    config.title = config.title .. ' [Sort: ' .. ({
+      [MiniFiles.default_sort] = 'Default',
+      [MiniFiles.time_sort] = 'Mod. Time',
+      [MiniFiles.size_sort] = 'Size',
+    })[MiniFiles.config.content.sort] .. ']'
+  end
 
   -- Update config
   config.relative = 'editor'
@@ -2298,7 +2306,7 @@ H.fs_read_dir = function(path, content_opts)
       table.insert(res, { fs_type = fs_type, name = name, path = H.fs_child_path(path, name) })
     else
       local child_path = H.fs_child_path(path, name)
-      local stats = vim.uv.fs_stat(child_path)
+      local stats = vim.loop.fs_stat(child_path)
       if stats then
         table.insert(res, { size = stats.size, mtime = stats.mtime.sec, fs_type = fs_type, name = name, path = child_path })
       end
