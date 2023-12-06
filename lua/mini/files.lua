@@ -610,6 +610,7 @@ MiniFiles.config = {
     synchronize = '=',
     trim_left   = '<',
     trim_right  = '>',
+    cycle_sort = 'gs',
   },
 
   -- General options
@@ -1025,6 +1026,42 @@ MiniFiles.default_sort = function(fs_entries)
   return vim.tbl_map(function(x) return { name = x.name, fs_type = x.fs_type, path = x.path } end, res)
 end
 
+MiniFiles.time_sort = function(fs_entries)
+  -- Sort based on size
+  table.sort(fs_entries,
+    function(a, b)
+      return a.mtime > b.mtime
+    end)
+
+  return vim.tbl_map(function(x) return { name = x.name, fs_type = x.fs_type, path = x.path } end, fs_entries)
+end
+
+MiniFiles.size_sort = function(fs_entries)
+  -- Sort based on size
+  table.sort(fs_entries,
+    function(a, b)
+      if a.fs_type == 'directory' then
+        return false
+      elseif b.fs_type == 'directory' then
+        return true
+      end
+      return a.size > b.size
+    end)
+
+  return vim.tbl_map(function(x) return { name = x.name, fs_type = x.fs_type, path = x.path } end, fs_entries)
+end
+
+MiniFiles.cycle_sort = function ()
+  local sort = MiniFiles.config.content.sort
+	if sort == MiniFiles.default_sort then
+	  MiniFiles.config.content.sort = MiniFiles.size_sort
+  elseif sort == MiniFiles.size_sort then
+	  MiniFiles.config.content.sort = MiniFiles.time_sort
+  else
+	  MiniFiles.config.content.sort = MiniFiles.default_sort
+  end
+  MiniFiles.refresh(MiniFiles.config)
+end
 -- Helper data ================================================================
 -- Module default config
 H.default_config = vim.deepcopy(MiniFiles.config)
@@ -1097,6 +1134,7 @@ H.setup_config = function(config)
     ['mappings.synchronize'] = { config.mappings.synchronize, 'string' },
     ['mappings.trim_left'] = { config.mappings.trim_left, 'string' },
     ['mappings.trim_right'] = { config.mappings.trim_right, 'string' },
+    ['mappings.cycle_sort'] = { config.mappings.cycle_sort, 'string' },
 
     ['options.use_as_default_explorer'] = { config.options.use_as_default_explorer, 'boolean' },
     ['options.permanent_delete'] = { config.options.permanent_delete, 'boolean' },
@@ -1894,6 +1932,7 @@ H.buffer_make_mappings = function(buf_id, mappings)
   buf_map('n', mappings.synchronize, MiniFiles.synchronize, 'Synchronize')
   buf_map('n', mappings.trim_left,   MiniFiles.trim_left,   'Trim branch left')
   buf_map('n', mappings.trim_right,  MiniFiles.trim_right,  'Trim branch right')
+  buf_map('n', mappings.cycle_sort,  MiniFiles.cycle_sort,  'Cycle among sort options')
 
   H.map('x', mappings.go_in, go_in_visual, { buffer = buf_id, desc = 'Go in selected entries', expr = true })
   --stylua: ignore end
@@ -2133,6 +2172,13 @@ H.window_update = function(win_id, config)
     config.title = nil
   end
 
+  config.footer = 'Sort: ' .. ({
+    [MiniFiles.default_sort] = 'Default',
+    [MiniFiles.time_sort] = 'Mod. Time',
+    [MiniFiles.size_sort] = 'Size',
+  })[MiniFiles.config.content.sort]
+  config.footer_pos = 'right'
+
   -- Update config
   config.relative = 'editor'
   vim.api.nvim_win_set_config(win_id, config)
@@ -2248,7 +2294,15 @@ H.fs_read_dir = function(path, content_opts)
   local name, fs_type = vim.loop.fs_scandir_next(fs)
   while name do
     if not (fs_type == 'file' or fs_type == 'directory') then fs_type = H.fs_get_type(H.fs_child_path(path, name)) end
-    table.insert(res, { fs_type = fs_type, name = name, path = H.fs_child_path(path, name) })
+    if content_opts.sort ~= MiniFiles.size_sort and content_opts.sort ~= MiniFiles.time_sort then
+      table.insert(res, { fs_type = fs_type, name = name, path = H.fs_child_path(path, name) })
+    else
+      local child_path = H.fs_child_path(path, name)
+      local stats = vim.uv.fs_stat(child_path)
+      if stats then
+        table.insert(res, { size = stats.size, mtime = stats.mtime.sec, fs_type = fs_type, name = name, path = child_path })
+      end
+    end
     name, fs_type = vim.loop.fs_scandir_next(fs)
   end
 
