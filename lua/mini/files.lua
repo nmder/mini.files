@@ -1033,7 +1033,7 @@ MiniFiles.time_sort = function(fs_entries)
       return a.mtime > b.mtime
     end)
 
-  return vim.tbl_map(function(x) return { name = x.name, fs_type = x.fs_type, path = x.path } end, fs_entries)
+  return fs_entries
 end
 
 MiniFiles.size_sort = function(fs_entries)
@@ -1048,7 +1048,7 @@ MiniFiles.size_sort = function(fs_entries)
       return a.size > b.size
     end)
 
-  return vim.tbl_map(function(x) return { name = x.name, fs_type = x.fs_type, path = x.path } end, fs_entries)
+  return fs_entries
 end
 
 MiniFiles.cycle_sort = function ()
@@ -1955,6 +1955,14 @@ H.buffer_update = function(buf_id, path, opts)
   return vim.tbl_map(function(x) return x.path_id end, fs_entries)
 end
 
+H.bytes_to_size = function (bytes)
+  if not bytes then return '' end
+  local sizes = {'B', 'K', 'M', 'G', 'T'}
+  if bytes == 0 then return '0B' end
+  local i = math.floor(math.log(bytes) / math.log(1024))
+  return string.format("%d%s", bytes / math.pow(1024, i), sizes[i + 1])
+end
+
 H.buffer_update_directory = function(buf_id, path, opts)
   local lines, icon_hl, name_hl = {}, {}, {}
 
@@ -1990,7 +1998,14 @@ H.buffer_update_directory = function(buf_id, path, opts)
     local icon_opts = { hl_group = icon_hl[i], end_col = name_start - 1, right_gravity = false }
     set_hl(i - 1, icon_start - 1, icon_opts)
 
-    local name_opts = { hl_group = name_hl[i], end_row = i, end_col = 0, right_gravity = false }
+    local name_opts = {
+      hl_group = name_hl[i],
+      end_row = i,
+      end_col = 0,
+      right_gravity = false,
+      virt_text = { { MiniFiles.config.content.sort == MiniFiles.size_sort and (fs_entries[i].fs_type ~= 'directory' and H.bytes_to_size(fs_entries[i].size) or '') or (MiniFiles.config.content.sort == MiniFiles.time_sort and os.date("%d-%m-%y %H:%M", fs_entries[i].mtime) or ''), "MiniFilesTitle" } },
+      virt_text_pos = "right_align",
+    }
     set_hl(i - 1, name_start - 1, name_opts)
   end
 
