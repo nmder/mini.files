@@ -45,7 +45,7 @@
 ---     - In case of missing file, check its or its parent read permissions.
 ---     - In case of no manipulation result, check write permissions.
 ---
---- # Dependencies~
+--- # Dependencies ~
 ---
 --- Suggested dependencies (provide extra functionality, will work without them):
 --- - Plugin 'nvim-tree/nvim-web-devicons' for filetype icons near the entry
@@ -1187,8 +1187,9 @@ H.create_default_hl = function()
   hi('MiniFilesTitleFocused',   { link = 'FloatTitle' })
 end
 
-H.get_config =
-  function(config) return vim.tbl_deep_extend('force', MiniFiles.config, vim.b.minifiles_config or {}, config or {}) end
+H.get_config = function(config)
+  return vim.tbl_deep_extend('force', MiniFiles.config, vim.b.minifiles_config or {}, config or {})
+end
 
 H.normalize_opts = function(explorer_opts, opts)
   opts = vim.tbl_deep_extend('force', H.get_config(), explorer_opts or {}, opts or {})
@@ -1235,6 +1236,8 @@ end
 ---   history and for `reset()` operation.
 ---@field target_window number Id of window in which files will be opened.
 ---@field opts table Options used for this particular explorer.
+---@field is_corrupted boolean Whether this particular explorer can not be
+---   normalized and should be closed.
 ---@private
 H.explorer_new = function(path)
   return {
@@ -1268,6 +1271,12 @@ end
 
 H.explorer_refresh = function(explorer, opts)
   explorer = H.explorer_normalize(explorer)
+  if explorer.is_corrupted then
+    -- Make sure that same explorer can be opened later from history
+    explorer.is_corrupted = false
+    MiniFiles.close()
+    return
+  end
   if #explorer.branch == 0 then return end
   opts = opts or {}
 
@@ -1358,6 +1367,11 @@ H.explorer_normalize = function(explorer)
   for i = cur_max_depth + 1, #explorer.windows do
     H.window_close(explorer.windows[i])
     explorer.windows[i] = nil
+  end
+
+  -- Compute if explorer is corrupted and should not operate further
+  for _, win_id in pairs(explorer.windows) do
+    if not H.is_valid_win(win_id) then explorer.is_corrupted = true end
   end
 
   return explorer
