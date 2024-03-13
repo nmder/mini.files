@@ -1220,7 +1220,12 @@ H.track_dir_edit = function(data)
   -- Make early returns
   if vim.api.nvim_get_current_buf() ~= data.buf then return end
 
-  if vim.b.minifiles_processed_dir then return vim.api.nvim_buf_delete(0, { force = true }) end
+  if vim.b.minifiles_processed_dir then
+    -- Smartly delete directory buffer if already visited
+    local alt_buf = vim.fn.bufnr('#')
+    if alt_buf ~= data.buf and vim.fn.buflisted(alt_buf) == 1 then vim.api.nvim_win_set_buf(0, alt_buf) end
+    return vim.api.nvim_buf_delete(data.buf, { force = true })
+  end
 
   local path = vim.api.nvim_buf_get_name(0)
   if vim.fn.isdirectory(path) ~= 1 then return end
@@ -2376,6 +2381,14 @@ H.add_path_to_index = function(path)
   return new_id
 end
 
+H.replace_path_in_index = function(from, to)
+  local from_id, to_id = H.path_index[from], H.path_index[to]
+  H.path_index[from_id], H.path_index[to] = to, from_id
+  if to_id then H.path_index[to_id] = nil end
+  -- Remove `from` from index assuming it doesn't exist anymore (no duplicates)
+  H.path_index[from] = nil
+end
+
 H.compare_fs_entries = function(a, b)
   -- Put directory first
   if a.is_dir and not b.is_dir then return true end
@@ -2527,7 +2540,7 @@ end
 
 H.fs_create = function(path)
   -- Don't override existing path
-  if H.fs_is_present_path(path) then return false end
+  if H.fs_is_present_path(path) then return H.warn_existing_path(path, 'create') end
 
   -- Create parent directory allowing nested names
   vim.fn.mkdir(H.fs_get_parent(path), 'p')
@@ -2543,7 +2556,7 @@ end
 
 H.fs_copy = function(from, to)
   -- Don't override existing path
-  if H.fs_is_present_path(to) then return false end
+  if H.fs_is_present_path(to) then return H.warn_existing_path(from, 'copy') end
 
   local from_type = H.fs_get_type(from)
   if from_type == nil then return false end
@@ -2584,11 +2597,17 @@ end
 
 H.fs_move = function(from, to)
   -- Don't override existing path
-  if H.fs_is_present_path(to) then return false end
+  if H.fs_is_present_path(to) then return H.warn_existing_path(from, 'move or rename') end
 
   -- Move while allowing to create directory
   vim.fn.mkdir(H.fs_get_parent(to), 'p')
   local success = vim.loop.fs_rename(from, to)
+
+  if not success then return success end
+
+  -- Update path index to allow consecutive moves after undo (which also
+  -- restores previous concealed path index)
+  H.replace_path_in_index(from, to)
 
   -- Rename in loaded buffers
   for _, buf_id in ipairs(vim.api.nvim_list_bufs()) do
@@ -2615,6 +2634,11 @@ H.rename_loaded_buffer = function(buf_id, from, to)
   vim.api.nvim_buf_call(buf_id, function() vim.cmd('silent! write! | edit') end)
 end
 
+H.warn_existing_path = function(path, action)
+  H.notify(string.format('Can not %s %s. Target path already exists.', action, path), 'WARN')
+  return false
+end
+
 -- Validators -----------------------------------------------------------------
 H.validate_opened_buffer = function(x)
   if x == nil or x == 0 then x = vim.api.nvim_get_current_buf() end
@@ -2632,6 +2656,8 @@ end
 
 -- Utilities ------------------------------------------------------------------
 H.error = function(msg) error(string.format('(mini.files) %s', msg), 0) end
+
+H.notify = function(msg, level_name) vim.notify('(mini.files) ' .. msg, vim.log.levels[level_name]) end
 
 H.map = function(mode, lhs, rhs, opts)
   if lhs == '' then return end
