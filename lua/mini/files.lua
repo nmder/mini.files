@@ -598,6 +598,7 @@ MiniFiles.config = {
     prefix = nil,
     -- In which order to show file system entries
     sort = nil,
+    sort_label = false,
   },
 
   -- Module mappings created only inside explorer.
@@ -615,6 +616,7 @@ MiniFiles.config = {
     trim_left   = '<',
     trim_right  = '>',
     cycle_sort = 'gs',
+    cycle_sort_label = 'gl',
   },
 
   -- General options
@@ -1087,6 +1089,11 @@ MiniFiles.cycle_sort = function ()
   end
   MiniFiles.refresh(MiniFiles.config)
 end
+
+MiniFiles.cycle_sort_label = function ()
+  MiniFiles.config.content.sort_label = not MiniFiles.config.content.sort_label
+  MiniFiles.refresh(MiniFiles.config)
+end
 -- Helper data ================================================================
 -- Module default config
 H.default_config = vim.deepcopy(MiniFiles.config)
@@ -1160,6 +1167,7 @@ H.setup_config = function(config)
     ['mappings.trim_left'] = { config.mappings.trim_left, 'string' },
     ['mappings.trim_right'] = { config.mappings.trim_right, 'string' },
     ['mappings.cycle_sort'] = { config.mappings.cycle_sort, 'string' },
+    ['mappings.cycle_sort_label'] = { config.mappings.cycle_sort_label, 'string' },
 
     ['options.use_as_default_explorer'] = { config.options.use_as_default_explorer, 'boolean' },
     ['options.permanent_delete'] = { config.options.permanent_delete, 'boolean' },
@@ -1976,6 +1984,7 @@ H.buffer_make_mappings = function(buf_id, mappings)
   buf_map('n', mappings.trim_left,   MiniFiles.trim_left,   'Trim branch left')
   buf_map('n', mappings.trim_right,  MiniFiles.trim_right,  'Trim branch right')
   buf_map('n', mappings.cycle_sort,  MiniFiles.cycle_sort,  'Cycle among sort options')
+  buf_map('n', mappings.cycle_sort_label,  MiniFiles.cycle_sort_label,  'Toggle sort label visibility')
 
   H.map('x', mappings.go_in, go_in_visual, { buffer = buf_id, desc = 'Go in selected entries', expr = true })
   --stylua: ignore end
@@ -2046,7 +2055,7 @@ H.buffer_update_directory = function(buf_id, path, opts)
       end_row = i,
       end_col = 0,
       right_gravity = false,
-      virt_text = { { MiniFiles.config.content.sort == MiniFiles.size_sort and (fs_entries[i].fs_type ~= 'directory' and H.bytes_to_size(fs_entries[i].size) or '') or (MiniFiles.config.content.sort == MiniFiles.time_sort and os.date("%d-%m-%y %H:%M", fs_entries[i].mtime) or ''), "MiniFilesTitle" } },
+      virt_text = { { MiniFiles.config.content.sort_label and (MiniFiles.config.content.sort == MiniFiles.size_sort and (fs_entries[i].fs_type ~= 'directory' and H.bytes_to_size(fs_entries[i].size) or '') or (MiniFiles.config.content.sort == MiniFiles.time_sort and os.date("%d-%m-%y %H:%M", fs_entries[i].mtime) or '')) or '', "MiniFilesTitle" } },
       virt_text_pos = "right_align",
     }
     set_hl(i - 1, name_start - 1, name_opts)
