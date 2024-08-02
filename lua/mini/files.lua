@@ -1029,7 +1029,7 @@ MiniFiles.default_prefix = function(fs_entry)
   -- Prefer 'mini.icons'
   if _G.MiniIcons ~= nil then
     local category = fs_entry.fs_type == 'directory' and 'directory' or 'file'
-    local icon, hl = _G.MiniIcons.get(category, fs_entry.name)
+    local icon, hl = _G.MiniIcons.get(category, fs_entry.path)
     return icon .. ' ', hl
   end
 
