@@ -226,11 +226,14 @@ General workflow:
   so you can navigate in and out of directory with modified buffer.
 
 - Execute |MiniFiles.synchronize()| (default key is `=`). This will prompt
-  confirmation dialog listing all file system actions it is about to perform.
-  READ IT CAREFULLY.
+  confirmation dialog listing all file system actions (per directory) it is
+  about to perform. READ IT CAREFULLY.
 
-- Confirm by pressing `y`/`<CR>` (applies edits and updates buffers) or
-  don't confirm by pressing `n`/`<Esc>` (updates buffers without applying edits).
+- Confirm by pressing `y` / `<CR>` (apply edits and update buffers) or
+  don't confirm by pressing `n` / `<Esc>` (update buffers without applying edits).
+
+Note: prefer small and not related steps with more frequent synchronization
+over single complex manipulation. There are (known) cases which won't work.
 
 # How does it work ~
 
@@ -244,6 +247,7 @@ DO NOT modify text to the left of entry name.
 
 During synchronization, actual text for entry name is compared to path index
 at that line (if present) to deduce which file system action to perform.
+Note that order of text manipulation steps does not affect performed actions.
 
 # Supported file system actions ~
 
@@ -327,8 +331,8 @@ UI events ~
 - `MiniFilesWindowOpen` - when new window is opened. Can be used to set
   window-local settings (like border, 'winblend', etc.)
 
-- `MiniFilesWindowUpdate` - when a window is updated. Triggers frequently,
-  for example, for every "go in" or "go out" action.
+- `MiniFilesWindowUpdate` - when a window is updated. Triggers VERY frequently.
+  At least after every cursor movement and "go in" / "go out" action.
 
 Callback for each UI event will receive `data` field (see |nvim_create_autocmd()|)
 with the following information:
@@ -354,8 +358,8 @@ Callback for each file action event will receive `data` field
 (see |nvim_create_autocmd()|) with the following information:
 
 - <action> - string with action name.
-- <from> - absolute path of entry before action (`nil` for "create" action).
-- <to> - absolute path of entry after action (`nil` for "delete" action).
+- <from> - full path of entry before action (`nil` for "create" action).
+- <to> - full path of entry after action (`nil` for permanent "delete" action).
 
 ------------------------------------------------------------------------------
                                                             *MiniFiles-examples*
@@ -371,7 +375,8 @@ Use a combination of |MiniFiles.open()| and |MiniFiles.close()|: >lua
 <
 # Customize windows ~
 
-Create an autocommand for `MiniFilesWindowOpen` event: >lua
+For most of the common customizations using `MiniFilesWindowOpen` event
+autocommand is the suggested approach: >lua
 
   vim.api.nvim_create_autocmd('User', {
     pattern = 'MiniFilesWindowOpen',
@@ -386,9 +391,32 @@ Create an autocommand for `MiniFilesWindowOpen` event: >lua
     end,
   })
 <
+However, some parts (like window title and height) of window config are later
+updated internally. Use `MiniFilesWindowUpdate` event for them: >lua
+
+  vim.api.nvim_create_autocmd('User', {
+    pattern = 'MiniFilesWindowUpdate',
+    callback = function(args)
+      local config = vim.api.nvim_win_get_config(args.data.win_id)
+
+      -- Ensure fixed height
+      config.height = 10
+
+      -- Ensure title padding
+      if config.title[#config.title][1] ~= ' ' then
+        table.insert(config.title, { ' ', 'NormalFloat' })
+      end
+      if config.title[1][1] ~= ' ' then
+        table.insert(config.title, 1, { ' ', 'NormalFloat' })
+      end
+
+      vim.api.nvim_win_set_config(args.data.win_id, config)
+    end,
+  })
+<
 # Customize icons ~
 
-Use different directory icon: >lua
+Use different directory icon (if you don't use |mini.icons|): >lua
 
   local my_prefix = function(fs_entry)
     if fs_entry.fs_type == 'directory' then
@@ -712,7 +740,7 @@ Depends on entry under cursor:
   Explorer is not closed after that.
 
 Parameters ~
-{opts} Options. Possible fields:
+{opts} `(table|nil)` Options. Possible fields:
   - <close_on_file> `(boolean)` - whether to close explorer after going
     inside a file. Powers the `go_in_plus` mapping.
     Default: `false`.

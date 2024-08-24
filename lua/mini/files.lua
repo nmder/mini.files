@@ -223,11 +223,14 @@
 ---   so you can navigate in and out of directory with modified buffer.
 ---
 --- - Execute |MiniFiles.synchronize()| (default key is `=`). This will prompt
----   confirmation dialog listing all file system actions it is about to perform.
----   READ IT CAREFULLY.
+---   confirmation dialog listing all file system actions (per directory) it is
+---   about to perform. READ IT CAREFULLY.
 ---
---- - Confirm by pressing `y`/`<CR>` (applies edits and updates buffers) or
----   don't confirm by pressing `n`/`<Esc>` (updates buffers without applying edits).
+--- - Confirm by pressing `y` / `<CR>` (apply edits and update buffers) or
+---   don't confirm by pressing `n` / `<Esc>` (update buffers without applying edits).
+---
+--- Note: prefer small and not related steps with more frequent synchronization
+--- over single complex manipulation. There are (known) cases which won't work.
 ---
 --- # How does it work ~
 ---
@@ -241,6 +244,7 @@
 ---
 --- During synchronization, actual text for entry name is compared to path index
 --- at that line (if present) to deduce which file system action to perform.
+--- Note that order of text manipulation steps does not affect performed actions.
 ---
 --- # Supported file system actions ~
 ---
@@ -323,8 +327,8 @@
 --- - `MiniFilesWindowOpen` - when new window is opened. Can be used to set
 ---   window-local settings (like border, 'winblend', etc.)
 ---
---- - `MiniFilesWindowUpdate` - when a window is updated. Triggers frequently,
----   for example, for every "go in" or "go out" action.
+--- - `MiniFilesWindowUpdate` - when a window is updated. Triggers VERY frequently.
+---   At least after every cursor movement and "go in" / "go out" action.
 ---
 --- Callback for each UI event will receive `data` field (see |nvim_create_autocmd()|)
 --- with the following information:
@@ -350,8 +354,8 @@
 --- (see |nvim_create_autocmd()|) with the following information:
 ---
 --- - <action> - string with action name.
---- - <from> - absolute path of entry before action (`nil` for "create" action).
---- - <to> - absolute path of entry after action (`nil` for "delete" action).
+--- - <from> - full path of entry before action (`nil` for "create" action).
+--- - <to> - full path of entry after action (`nil` for permanent "delete" action).
 ---@tag MiniFiles-events
 
 --- Common configuration examples ~
@@ -366,7 +370,8 @@
 --- <
 --- # Customize windows ~
 ---
---- Create an autocommand for `MiniFilesWindowOpen` event: >lua
+--- For most of the common customizations using `MiniFilesWindowOpen` event
+--- autocommand is the suggested approach: >lua
 ---
 ---   vim.api.nvim_create_autocmd('User', {
 ---     pattern = 'MiniFilesWindowOpen',
@@ -381,9 +386,32 @@
 ---     end,
 ---   })
 --- <
+--- However, some parts (like window title and height) of window config are later
+--- updated internally. Use `MiniFilesWindowUpdate` event for them: >lua
+---
+---   vim.api.nvim_create_autocmd('User', {
+---     pattern = 'MiniFilesWindowUpdate',
+---     callback = function(args)
+---       local config = vim.api.nvim_win_get_config(args.data.win_id)
+---
+---       -- Ensure fixed height
+---       config.height = 10
+---
+---       -- Ensure title padding
+---       if config.title[#config.title][1] ~= ' ' then
+---         table.insert(config.title, { ' ', 'NormalFloat' })
+---       end
+---       if config.title[1][1] ~= ' ' then
+---         table.insert(config.title, 1, { ' ', 'NormalFloat' })
+---       end
+---
+---       vim.api.nvim_win_set_config(args.data.win_id, config)
+---     end,
+---   })
+--- <
 --- # Customize icons ~
 ---
---- Use different directory icon: >lua
+--- Use different directory icon (if you don't use |mini.icons|): >lua
 ---
 ---   local my_prefix = function(fs_entry)
 ---     if fs_entry.fs_type == 'directory' then
@@ -762,7 +790,7 @@ MiniFiles.synchronize = function()
 
   -- Parse and apply file system operations
   local fs_actions = H.explorer_compute_fs_actions(explorer)
-  if fs_actions ~= nil and H.fs_actions_confirm(fs_actions) then H.fs_actions_apply(fs_actions, explorer.opts) end
+  if fs_actions ~= nil and H.fs_actions_confirm(fs_actions) then H.fs_actions_apply(fs_actions) end
 
   H.explorer_refresh(explorer, { force_update = true })
 end
@@ -846,7 +874,7 @@ end
 --- - If file, open it in the window which was current during |MiniFiles.open()|.
 ---   Explorer is not closed after that.
 ---
----@param opts Options. Possible fields:
+---@param opts table|nil Options. Possible fields:
 ---   - <close_on_file> `(boolean)` - whether to close explorer after going
 ---     inside a file. Powers the `go_in_plus` mapping.
 ---     Default: `false`.
@@ -966,10 +994,7 @@ MiniFiles.get_fs_entry = function(buf_id, line)
   line = H.validate_line(buf_id, line)
 
   local path_id = H.match_line_path_id(H.get_bufline(buf_id, line))
-  if path_id == nil then return nil end
-
-  local path = H.path_index[path_id]
-  return { fs_type = H.fs_get_type(path), name = H.fs_get_basename(path), path = path }
+  return H.get_fs_entry_from_path_index(path_id)
 end
 
 --- Get target window
@@ -1142,6 +1167,7 @@ H.latest_paths = {}
 
 -- Register of opened buffer data for quick access. Tables per buffer id:
 -- - <path> - path which contents this buffer displays.
+-- - <children_path_ids> - array of shown children path ids.
 -- - <win_id> - id of window this buffer is shown. Can be `nil`.
 -- - <n_modified> - number of modifications since last update from this module.
 --   Values bigger than 0 can be treated as if buffer was modified by user.
@@ -1151,9 +1177,6 @@ H.opened_buffers = {}
 
 -- File system information
 H.is_windows = vim.loop.os_uname().sysname == 'Windows_NT'
-
--- Register table to decide whether certain autocmd events should be triggered
-H.block_event_trigger = {}
 
 -- Helper functionality =======================================================
 -- Settings -------------------------------------------------------------------
@@ -1284,11 +1307,10 @@ end
 ---@field depth_focus number Depth to focus.
 ---@field views table Views for paths. Each view is a table with:
 ---   - <buf_id> where to show directory content.
+---   - <was_focused> - whether buffer was focused during current session.
 ---   - <cursor> to position cursor; can be:
 ---       - `{ line, col }` table to set cursor when buffer changes window.
 ---       - `entry_name` string entry name to find inside directory buffer.
----   - <children_path_ids> - array with children path ids present during
----     latest directory update.
 ---@field windows table Array of currently opened window ids (left to right).
 ---@field anchor string Anchor directory of the explorer. Used as index in
 ---   history and for `reset()` operation.
@@ -1342,13 +1364,23 @@ H.explorer_refresh = function(explorer, opts)
   -- cursors to "stick" to current items.
   if not opts.skip_update_cursor then explorer = H.explorer_update_cursors(explorer) end
 
+  -- Ensure no outdated views
+  for path, view in pairs(explorer.views) do
+    if not H.fs_is_present_path(path) then
+      H.buffer_delete(view.buf_id)
+      explorer.views[path] = nil
+    end
+  end
+
   -- Possibly force content updates on all explorer buffers. Doing it for *all*
-  -- of them and not only on modified once to allow synch outside changes.
+  -- of them and not only on modified ones to allow sync changes from outside.
   if opts.force_update then
     for path, view in pairs(explorer.views) do
       -- Encode cursors to allow them to "stick" to current entry
       view = H.view_encode_cursor(view)
-      view.children_path_ids = H.buffer_update(view.buf_id, path, explorer.opts)
+      -- Force update of shown path ids
+      if H.opened_buffers[view.buf_id] then H.opened_buffers[view.buf_id].children_path_ids = nil end
+      H.buffer_update(view.buf_id, path, explorer.opts, not view.was_focused)
       explorer.views[path] = view
     end
   end
@@ -1485,6 +1517,16 @@ H.explorer_go_in_range = function(explorer, buf_id, from_line, to_line)
     if fs_entry.fs_type == 'directory' then
       path, line = fs_entry.path, i
     end
+    if fs_entry.fs_type == nil and fs_entry.path == nil then
+      local entry = vim.inspect(H.get_bufline(buf_id, i))
+      H.notify('Line ' .. entry .. ' does not have proper format. Did you modify without synchronization?', 'WARN')
+    end
+    if fs_entry.fs_type == nil and fs_entry.path ~= nil then
+      local path_resolved = vim.fn.resolve(fs_entry.path)
+      local symlink_info = path_resolved == fs_entry.path and ''
+        or (' Looks like miscreated symlink (resolved to ' .. path_resolved .. ').')
+      H.notify('Path ' .. fs_entry.path .. ' is not present on disk.' .. symlink_info, 'WARN')
+    end
   end
 
   for _, file_path in ipairs(files) do
@@ -1524,18 +1566,18 @@ H.explorer_compute_fs_actions = function(explorer)
   -- Compute differences
   local fs_diffs = {}
   for _, view in pairs(explorer.views) do
-    local dir_fs_diff = H.buffer_compute_fs_diff(view.buf_id, view.children_path_ids)
+    local dir_fs_diff = H.buffer_compute_fs_diff(view.buf_id)
     if #dir_fs_diff > 0 then vim.list_extend(fs_diffs, dir_fs_diff) end
   end
   if #fs_diffs == 0 then return nil end
 
   -- Convert differences into actions
-  local create, delete_map, rename, move, raw_copy = {}, {}, {}, {}, {}
+  local create, delete_map, raw_copy = {}, {}, {}
 
   -- - Differentiate between create, delete, and copy
   for _, diff in ipairs(fs_diffs) do
     if diff.from == nil then
-      table.insert(create, diff.to)
+      table.insert(create, { action = 'create', dir = diff.dir, to = diff.to })
     elseif diff.to == nil then
       delete_map[diff.from] = true
     else
@@ -1543,26 +1585,51 @@ H.explorer_compute_fs_actions = function(explorer)
     end
   end
 
-  -- - Possibly narrow down copy action into move or rename:
-  --   `delete + copy` is `rename` if in same directory and `move` otherwise
-  local copy = {}
+  -- - Narrow down copy action into rename or move: `delete + copy` is `rename`
+  --   if in same directory and `move` otherwise
+  local rename, move, copy = {}, {}, {}
   for _, diff in pairs(raw_copy) do
+    local action, target = 'copy', copy
     if delete_map[diff.from] then
-      if H.fs_get_parent(diff.from) == H.fs_get_parent(diff.to) then
-        table.insert(rename, diff)
-      else
-        table.insert(move, diff)
-      end
-
-      -- NOTE: Can't use `delete` as array here in order for path to be moved
-      -- or renamed only single time
+      action = H.fs_get_parent(diff.from) == H.fs_get_parent(diff.to) and 'rename' or 'move'
+      target = action == 'rename' and rename or move
+      -- NOTE: Use map instead of array to ensure single move/rename per path
       delete_map[diff.from] = nil
-    else
-      table.insert(copy, diff)
+    end
+    table.insert(target, { action = action, dir = diff.dir, from = diff.from, to = diff.to })
+  end
+
+  -- Compute delete actions accounting for (non) permanent delete
+  local delete, is_trash = {}, not explorer.opts.options.permanent_delete
+  local trash_dir = H.fs_child_path(vim.fn.stdpath('data'), 'mini.files/trash')
+  for p, _ in pairs(delete_map) do
+    local to = is_trash and H.fs_child_path(trash_dir, H.fs_get_basename(p)) or nil
+    table.insert(delete, { action = 'delete', from = p, to = to })
+  end
+
+  -- Construct final array with proper order of actions:
+  -- - If action depends on the path which will be deleted, perform it first.
+  -- - "Delete"/"move"/"rename" before "copy"/"create" to free space for them.
+  -- - Move/rename (if successful) will later adjust next steps at execution.
+  local before_delete, after_delete = {}, {}
+  for _, arr in ipairs({ move, rename, copy, create }) do
+    for _, diff in ipairs(arr) do
+      local will_be_deleted = false
+      for _, del in ipairs(delete) do
+        local from_is_affected = del.from == diff.from or vim.startswith(diff.from or '', del.from .. '/')
+        -- Don't directly account for deleted path to allow "act on freed path"
+        local to_is_affected = vim.startswith(diff.to, del.from .. '/')
+        will_be_deleted = will_be_deleted or from_is_affected or to_is_affected
+      end
+      table.insert(will_be_deleted and before_delete or after_delete, diff)
     end
   end
 
-  return { create = create, delete = vim.tbl_keys(delete_map), copy = copy, rename = rename, move = move }
+  local res = {}
+  vim.list_extend(res, before_delete)
+  vim.list_extend(res, delete)
+  vim.list_extend(res, after_delete)
+  return res
 end
 
 H.explorer_update_cursors = function(explorer)
@@ -1581,16 +1648,16 @@ H.explorer_refresh_depth_window = function(explorer, depth, win_count, win_col)
   local path = explorer.branch[depth]
   local views, windows, opts = explorer.views, explorer.windows, explorer.opts
 
-  -- Prepare target view
-  local view = views[path] or {}
-  view = H.view_ensure_proper(view, path, opts)
-  views[path] = view
-
   -- Compute width based on window role
   local win_is_focused = depth == explorer.depth_focus
   local win_is_preview = opts.windows.preview and (depth == (explorer.depth_focus + 1))
   local cur_width = win_is_focused and opts.windows.width_focus
     or (win_is_preview and opts.windows.width_preview or opts.windows.width_nofocus)
+
+  -- Prepare target view
+  local view = views[path] or {}
+  view = H.view_ensure_proper(view, path, opts, win_is_focused, win_is_preview)
+  views[path] = view
 
   -- Create relevant window config
   local config = {
@@ -1650,9 +1717,11 @@ H.explorer_open_file = function(explorer, path)
 
   -- Try to use already created buffer, if present. This avoids not needed
   -- `:edit` call and avoids some problems with auto-root from 'mini.misc'.
+  path = H.fs_normalize_path(path)
   local path_buf_id
   for _, buf_id in ipairs(vim.api.nvim_list_bufs()) do
-    local is_target = H.is_valid_buf(buf_id) and vim.bo[buf_id].buflisted and vim.api.nvim_buf_get_name(buf_id) == path
+    local is_same_name = H.fs_normalize_path(vim.api.nvim_buf_get_name(buf_id)) == path
+    local is_target = H.is_valid_buf(buf_id) and vim.bo[buf_id].buflisted and is_same_name
     if is_target then path_buf_id = buf_id end
   end
 
@@ -1806,17 +1875,21 @@ H.compute_visible_depth_range = function(explorer, opts)
 end
 
 -- Views ----------------------------------------------------------------------
-H.view_ensure_proper = function(view, path, opts)
+H.view_ensure_proper = function(view, path, opts, is_focused, is_preview)
   -- Ensure proper buffer
-  if not H.is_valid_buf(view.buf_id) then
+  local needs_recreate, needs_reprocess = not H.is_valid_buf(view.buf_id), not view.was_focused and is_focused
+  if needs_recreate then
     H.buffer_delete(view.buf_id)
     view.buf_id = H.buffer_create(path, opts.mappings)
+  end
+  if needs_recreate or needs_reprocess then
     -- Make sure that pressing `u` in new buffer does nothing
     local cache_undolevels = vim.bo[view.buf_id].undolevels
     vim.bo[view.buf_id].undolevels = -1
-    view.children_path_ids = H.buffer_update(view.buf_id, path, opts)
+    H.buffer_update(view.buf_id, path, opts, is_preview)
     vim.bo[view.buf_id].undolevels = cache_undolevels
   end
+  view.was_focused = view.was_focused or is_focused
 
   -- Ensure proper cursor. If string, find it as line in current buffer.
   view.cursor = view.cursor or { 1, 0 }
@@ -1855,7 +1928,6 @@ end
 H.view_invalidate_buffer = function(view)
   H.buffer_delete(view.buf_id)
   view.buf_id = nil
-  view.children_path_ids = nil
   return view
 end
 
@@ -1888,10 +1960,7 @@ H.view_track_cursor = vim.schedule_wrap(function(data)
 
   explorer = H.explorer_sync_cursor_and_branch(explorer, buf_depth)
 
-  -- Don't trigger redundant window update events
-  H.block_event_trigger['MiniFilesWindowUpdate'] = true
   H.explorer_refresh(explorer)
-  H.block_event_trigger['MiniFilesWindowUpdate'] = false
 end)
 
 H.view_track_text_change = function(data)
@@ -1905,13 +1974,20 @@ H.view_track_text_change = function(data)
   -- Track window height
   if not H.is_valid_win(win_id) then return end
 
+  local cur_height = vim.api.nvim_win_get_height(win_id)
   local n_lines = vim.api.nvim_buf_line_count(buf_id)
-  local height = math.min(n_lines, H.window_get_max_height())
-  vim.api.nvim_win_set_height(win_id, height)
+  local new_height = math.min(n_lines, H.window_get_max_height())
+  vim.api.nvim_win_set_height(win_id, new_height)
+
+  -- Trigger appropriate event if window height has changed
+  if cur_height ~= new_height then
+    H.trigger_event('MiniFilesWindowUpdate', { buf_id = buf_id, win_id = win_id })
+    new_height = vim.api.nvim_win_get_height(win_id)
+  end
 
   -- Ensure that only buffer lines are shown. This can be not the case if after
   -- text edit cursor moved past previous last line.
-  local last_visible_line = vim.fn.line('w0', win_id) + height - 1
+  local last_visible_line = vim.fn.line('w0', win_id) + new_height - 1
   local out_of_buf_lines = last_visible_line - n_lines
   -- - Possibly scroll window upward (`\25` is an escaped `<C-y>`)
   if out_of_buf_lines > 0 then vim.cmd('normal! ' .. out_of_buf_lines .. '\25') end
@@ -2014,21 +2090,18 @@ H.buffer_make_mappings = function(buf_id, mappings)
   --stylua: ignore end
 end
 
-H.buffer_update = function(buf_id, path, opts)
+H.buffer_update = function(buf_id, path, opts, is_preview)
   if not (H.is_valid_buf(buf_id) and H.fs_is_present_path(path)) then return end
 
   -- Perform entry type specific updates
   local update_fun = H.fs_get_type(path) == 'directory' and H.buffer_update_directory or H.buffer_update_file
-  local fs_entries = update_fun(buf_id, path, opts)
+  update_fun(buf_id, path, opts, is_preview)
 
   -- Trigger dedicated event
   H.trigger_event('MiniFilesBufferUpdate', { buf_id = buf_id, win_id = H.opened_buffers[buf_id].win_id })
 
   -- Reset buffer as not modified
   H.opened_buffers[buf_id].n_modified = -1
-
-  -- Return array with children entries path ids for future synchronization
-  return vim.tbl_map(function(x) return x.path_id end, fs_entries)
 end
 
 H.bytes_to_size = function (bytes)
@@ -2039,19 +2112,29 @@ H.bytes_to_size = function (bytes)
   return string.format("%d%s", bytes / math.pow(1024, i), sizes[i + 1])
 end
 
-H.buffer_update_directory = function(buf_id, path, opts)
-  local lines, icon_hl, name_hl = {}, {}, {}
+H.buffer_update_directory = function(buf_id, path, opts, is_preview)
+  -- Compute and cache (to use during sync) shown file system entries
+  local children_path_ids = H.opened_buffers[buf_id].children_path_ids
+  local fs_entries = children_path_ids == nil and H.fs_read_dir(path, opts.content)
+    or vim.tbl_map(H.get_fs_entry_from_path_index, children_path_ids)
+  H.opened_buffers[buf_id].children_path_ids = children_path_ids
+    or vim.tbl_map(function(x) return x.path_id end, fs_entries)
 
-  -- Compute lines
-  local fs_entries = H.fs_read_dir(path, opts.content)
-
-  -- - Compute format expression resulting into same width path ids
+  -- Compute format expression resulting into same width path ids
   local path_width = math.floor(math.log10(#H.path_index)) + 1
   local line_format = '/%0' .. path_width .. 'd/%s/%s'
 
-  local prefix_fun = opts.content.prefix
-  for _, entry in ipairs(fs_entries) do
-    local prefix, hl = prefix_fun(entry)
+  -- Compute lines
+  local lines, icon_hl, name_hl = {}, {}, {}
+  local prefix_fun, n_computed_prefixes = opts.content.prefix, is_preview and vim.o.lines or math.huge
+  for i, entry in ipairs(fs_entries) do
+    local prefix, hl
+    -- Compute prefix only in visible preview (for performance).
+    -- NOTE: limiting entries in `fs_read_dir()` is not possible because all
+    -- entries are needed for a proper filter and sort.
+    if i <= n_computed_prefixes then
+      prefix, hl = prefix_fun(entry)
+    end
     prefix, hl = prefix or '', hl or ''
     table.insert(lines, string.format(line_format, H.path_index[entry.path], prefix, entry.name))
     table.insert(icon_hl, hl)
@@ -2084,20 +2167,16 @@ H.buffer_update_directory = function(buf_id, path, opts)
     }
     set_hl(i - 1, name_start - 1, name_opts)
   end
-
-  return fs_entries
 end
 
-H.buffer_update_file = function(buf_id, path, opts)
-  -- Determine if file is text. This is not 100% proof, but good enough.
+H.buffer_update_file = function(buf_id, path, opts, _)
+  -- Work only with readable text file. This is not 100% proof, but good enough.
   -- Source: https://github.com/sharkdp/content_inspector
-  local fd = vim.loop.fs_open(path, 'r', 1)
+  local fd, width_preview = vim.loop.fs_open(path, 'r', 1), opts.windows.width_preview
+  if fd == nil then return H.set_buflines(buf_id, { '-No-access' .. string.rep('-', width_preview) }) end
   local is_text = vim.loop.fs_read(fd, 1024):find('\0') == nil
   vim.loop.fs_close(fd)
-  if not is_text then
-    H.set_buflines(buf_id, { '-Non-text-file' .. string.rep('-', opts.windows.width_preview) })
-    return {}
-  end
+  if not is_text then return H.set_buflines(buf_id, { '-Non-text-file' .. string.rep('-', width_preview) }) end
 
   -- Compute lines. Limit number of read lines to work better on large files.
   local has_lines, read_res = pcall(vim.fn.readfile, path, '', vim.o.lines)
@@ -2114,8 +2193,6 @@ H.buffer_update_file = function(buf_id, path, opts)
     local has_ts, _ = pcall(vim.treesitter.start, buf_id, has_lang and lang or ft)
     if not has_ts then vim.bo[buf_id].syntax = ft end
   end
-
-  return {}
 end
 
 H.buffer_delete = function(buf_id)
@@ -2124,7 +2201,7 @@ H.buffer_delete = function(buf_id)
   H.opened_buffers[buf_id] = nil
 end
 
-H.buffer_compute_fs_diff = function(buf_id, ref_path_ids)
+H.buffer_compute_fs_diff = function(buf_id)
   if not H.is_modified_buffer(buf_id) then return {} end
 
   local path = H.opened_buffers[buf_id].path
@@ -2144,15 +2221,16 @@ H.buffer_compute_fs_diff = function(buf_id, ref_path_ids)
 
     -- Ignore blank lines and already synced entries (even several user-copied)
     if l:find('^%s*$') == nil and path_from ~= path_to then
-      table.insert(res, { from = path_from, to = path_to })
+      table.insert(res, { from = path_from, to = path_to, dir = path })
     elseif path_id ~= nil then
       present_path_ids[path_id] = true
     end
   end
 
   -- Detect missing file system entries
+  local ref_path_ids = H.opened_buffers[buf_id].children_path_ids
   for _, ref_id in ipairs(ref_path_ids) do
-    if not present_path_ids[ref_id] then table.insert(res, { from = H.path_index[ref_id], to = nil }) end
+    if not present_path_ids[ref_id] then table.insert(res, { from = H.path_index[ref_id], to = nil, dir = path }) end
   end
 
   return res
@@ -2419,6 +2497,12 @@ H.add_path_to_index = function(path)
   return new_id
 end
 
+H.get_fs_entry_from_path_index = function(path_id)
+  local path = H.path_index[path_id]
+  if path == nil then return nil end
+  return { fs_type = H.fs_get_type(path), name = H.fs_get_basename(path), path = path }
+end
+
 H.replace_path_in_index = function(from, to)
   local from_id, to_id = H.path_index[from], H.path_index[to]
   H.path_index[from_id], H.path_index[to] = to, from_id
@@ -2438,7 +2522,7 @@ end
 
 H.fs_normalize_path = function(path) return (path:gsub('/+', '/'):gsub('(.)/$', '%1')) end
 if H.is_windows then
-  H.fs_normalize_path = function(path) return (path:gsub('\\', '/'):gsub('/+', '/'):gsub('(.)/$', '%1')) end
+  H.fs_normalize_path = function(path) return (path:gsub('\\', '/'):gsub('/+', '/'):gsub('(.)[\\/]$', '%1')) end
 end
 
 H.fs_is_present_path = function(path) return vim.loop.fs_stat(path) ~= nil end
@@ -2451,8 +2535,7 @@ H.fs_shorten_path = function(path)
   -- Replace home directory with '~'
   path = H.fs_normalize_path(path)
   local home_dir = H.fs_normalize_path(vim.loop.os_homedir() or '~')
-  local res = path:gsub('^' .. vim.pesc(home_dir), '~')
-  return res
+  return (path:gsub('^' .. vim.pesc(home_dir), '~'))
 end
 
 H.fs_get_basename = function(path) return H.fs_normalize_path(path):match('[^/]+$') end
@@ -2487,52 +2570,36 @@ end
 
 H.fs_actions_to_lines = function(fs_actions)
   -- Gather actions per source directory
+  local short = H.fs_shorten_path
+  local dir
+  local rel = function(p) return vim.startswith(p, dir .. '/') and p:sub(#dir + 2):gsub('/$', '') or short(p) end
+
   local actions_per_dir = {}
+  --stylua: ignore
+  for _, diff in ipairs(fs_actions) do
+    -- Set grouping directory to also be used to compute relative paths
+    dir = diff.action == 'create' and diff.dir or H.fs_get_parent(diff.from)
 
-  local get_dir_actions = function(path)
-    local dir_path = H.fs_shorten_path(H.fs_get_parent(path))
-    local dir_actions = actions_per_dir[dir_path] or {}
-    actions_per_dir[dir_path] = dir_actions
-    return dir_actions
+    -- Compute line depending on action
+    local action, l = diff.action, nil
+    local to_type = (diff.to or ''):sub(-1) == '/' and 'directory' or 'file'
+    local del_type = diff.to == nil and 'permanently' or 'to trash'
+    if action == 'create' then l = string.format("CREATE │ %s (%s)",  rel(diff.to), to_type) end
+    if action == 'delete' then l = string.format("DELETE │ %s (%s)",  rel(diff.from), del_type) end
+    if action == 'copy'   then l = string.format("COPY   │ %s => %s", rel(diff.from), rel(diff.to)) end
+    if action == 'move'   then l = string.format("MOVE   │ %s => %s", rel(diff.from), rel(diff.to)) end
+    if action == 'rename' then l = string.format("RENAME │ %s => %s", rel(diff.from), rel(diff.to)) end
+
+    -- Add to per directory lines
+    local dir_actions = actions_per_dir[dir] or {}
+    table.insert(dir_actions, '  ' .. l)
+    actions_per_dir[dir] = dir_actions
   end
 
-  local get_quoted_basename = function(path) return string.format("'%s'", H.fs_get_basename(path)) end
-
-  for _, diff in ipairs(fs_actions.copy) do
-    local dir_actions = get_dir_actions(diff.from)
-    local l = string.format("    COPY: %s to '%s'", get_quoted_basename(diff.from), H.fs_shorten_path(diff.to))
-    table.insert(dir_actions, l)
-  end
-
-  for _, path in ipairs(fs_actions.create) do
-    local dir_actions = get_dir_actions(path)
-    local fs_type = path:find('/$') == nil and 'file' or 'directory'
-    local l = string.format('  CREATE: %s (%s)', get_quoted_basename(path), fs_type)
-    table.insert(dir_actions, l)
-  end
-
-  for _, path in ipairs(fs_actions.delete) do
-    local dir_actions = get_dir_actions(path)
-    local l = string.format('  DELETE: %s', get_quoted_basename(path))
-    table.insert(dir_actions, l)
-  end
-
-  for _, diff in ipairs(fs_actions.move) do
-    local dir_actions = get_dir_actions(diff.from)
-    local l = string.format("    MOVE: %s to '%s'", get_quoted_basename(diff.from), H.fs_shorten_path(diff.to))
-    table.insert(dir_actions, l)
-  end
-
-  for _, diff in ipairs(fs_actions.rename) do
-    local dir_actions = get_dir_actions(diff.from)
-    local l = string.format('  RENAME: %s to %s', get_quoted_basename(diff.from), get_quoted_basename(diff.to))
-    table.insert(dir_actions, l)
-  end
-
-  -- Convert to lines
+  -- Convert to final lines
   local res = { 'CONFIRM FILE SYSTEM ACTIONS', '' }
   for path, dir_actions in pairs(actions_per_dir) do
-    table.insert(res, path .. ':')
+    table.insert(res, short(path))
     vim.list_extend(res, dir_actions)
     table.insert(res, '')
   end
@@ -2540,41 +2607,27 @@ H.fs_actions_to_lines = function(fs_actions)
   return res
 end
 
-H.fs_actions_apply = function(fs_actions, opts)
-  -- Copy first to allow later proper deleting
-  for _, diff in ipairs(fs_actions.copy) do
-    local ok, success = pcall(H.fs_copy, diff.from, diff.to)
-    local data = { action = 'copy', from = diff.from, to = diff.to }
-    if ok and success then H.trigger_event('MiniFilesActionCopy', data) end
-  end
+H.fs_actions_apply = function(fs_actions)
+  for i = 1, #fs_actions do
+    local diff, action = fs_actions[i], fs_actions[i].action
+    local ok, success = pcall(H.fs_do[action], diff.from, diff.to)
+    if ok and success then
+      -- Trigger event
+      local to = action == 'create' and diff.to:gsub('/$', '') or diff.to
+      local data = { action = action, from = diff.from, to = to }
+      local action_titlecase = action:sub(1, 1):upper() .. action:sub(2)
+      H.trigger_event('MiniFilesAction' .. action_titlecase, data)
 
-  for _, path in ipairs(fs_actions.create) do
-    local ok, success = pcall(H.fs_create, path)
-    local data = { action = 'create', to = H.fs_normalize_path(path) }
-    if ok and success then H.trigger_event('MiniFilesActionCreate', data) end
-  end
-
-  for _, diff in ipairs(fs_actions.move) do
-    local ok, success = pcall(H.fs_move, diff.from, diff.to)
-    local data = { action = 'move', from = diff.from, to = diff.to }
-    if ok and success then H.trigger_event('MiniFilesActionMove', data) end
-  end
-
-  for _, diff in ipairs(fs_actions.rename) do
-    local ok, success = pcall(H.fs_rename, diff.from, diff.to)
-    local data = { action = 'rename', from = diff.from, to = diff.to }
-    if ok and success then H.trigger_event('MiniFilesActionRename', data) end
-  end
-
-  -- Delete last to not lose anything too early (just in case)
-  for _, path in ipairs(fs_actions.delete) do
-    local ok, success = pcall(H.fs_delete, path, opts.options.permanent_delete)
-    local data = { action = 'delete', from = path }
-    if ok and success then H.trigger_event('MiniFilesActionDelete', data) end
+      -- Modify later actions to account for file movement
+      local has_moved = to ~= nil and not (action == 'copy' or action == 'create')
+      if has_moved then H.adjust_after_move(diff.from, to, fs_actions, i + 1) end
+    end
   end
 end
 
-H.fs_create = function(path)
+H.fs_do = {}
+
+H.fs_do.create = function(_, path)
   -- Don't override existing path
   if H.fs_is_present_path(path) then return H.warn_existing_path(path, 'create') end
 
@@ -2582,15 +2635,12 @@ H.fs_create = function(path)
   vim.fn.mkdir(H.fs_get_parent(path), 'p')
 
   -- Create
-  local fs_type = path:find('/$') == nil and 'file' or 'directory'
-  if fs_type == 'directory' then
-    return vim.fn.mkdir(path) == 1
-  else
-    return vim.fn.writefile({}, path) == 0
-  end
+  local fs_type = path:sub(-1) == '/' and 'directory' or 'file'
+  if fs_type == 'directory' then return vim.fn.mkdir(path) == 1 end
+  return vim.fn.writefile({}, path) == 0
 end
 
-H.fs_copy = function(from, to)
+H.fs_do.copy = function(from, to)
   -- Don't override existing path
   if H.fs_is_present_path(to) then return H.warn_existing_path(from, 'copy') end
 
@@ -2610,34 +2660,33 @@ H.fs_copy = function(from, to)
 
   local success = true
   for _, entry in ipairs(fs_entries) do
-    success = success and H.fs_copy(entry.path, H.fs_child_path(to, entry.name))
+    success = success and H.fs_do.copy(entry.path, H.fs_child_path(to, entry.name))
   end
 
   return success
 end
 
-H.fs_delete = function(path, permanent_delete)
-  if permanent_delete then return vim.fn.delete(path, 'rf') == 0 end
-
-  -- Move to trash instead of permanent delete
-  local trash_dir = H.fs_child_path(vim.fn.stdpath('data'), 'mini.files/trash')
-  vim.fn.mkdir(trash_dir, 'p')
-
-  local trash_path = H.fs_child_path(trash_dir, H.fs_get_basename(path))
-
-  -- Ensure that same basenames are replaced
-  pcall(vim.fn.delete, trash_path, 'rf')
-
-  return vim.loop.fs_rename(path, trash_path)
+H.fs_do.delete = function(from, to)
+  -- Act based on whether delete is permanent or not
+  if to == nil then return vim.fn.delete(from, 'rf') == 0 end
+  pcall(vim.fn.delete, to, 'rf')
+  return H.fs_do.move(from, to)
 end
 
-H.fs_move = function(from, to)
+H.fs_do.move = function(from, to)
   -- Don't override existing path
   if H.fs_is_present_path(to) then return H.warn_existing_path(from, 'move or rename') end
 
   -- Move while allowing to create directory
   vim.fn.mkdir(H.fs_get_parent(to), 'p')
-  local success = vim.loop.fs_rename(from, to)
+  local success, _, err_code = vim.loop.fs_rename(from, to)
+
+  if err_code == 'EXDEV' then
+    -- Handle cross-device move separately as `loop.fs_rename` does not work
+    success = H.fs_do.copy(from, to)
+    if success then success = pcall(vim.fn.delete, from, 'rf') end
+    if not success then pcall(vim.fn.delete, to, 'rf') end
+  end
 
   if not success then return success end
 
@@ -2653,7 +2702,7 @@ H.fs_move = function(from, to)
   return success
 end
 
-H.fs_rename = H.fs_move
+H.fs_do.rename = H.fs_do.move
 
 H.rename_loaded_buffer = function(buf_id, from, to)
   if not (vim.api.nvim_buf_is_loaded(buf_id) and vim.bo[buf_id].buftype == '') then return end
@@ -2673,6 +2722,17 @@ end
 H.warn_existing_path = function(path, action)
   H.notify(string.format('Can not %s %s. Target path already exists.', action, path), 'WARN')
   return false
+end
+
+H.adjust_after_move = function(from, to, fs_actions, start_ind)
+  local from_dir_pattern, to_dir = '^' .. vim.pesc(from .. '/'), to .. '/'
+  for i = start_ind, #fs_actions do
+    local diff = fs_actions[i]
+    -- Adjust completely to use entry at new location
+    if diff.from ~= nil then diff.from = diff.from == from and to or diff.from:gsub(from_dir_pattern, to_dir) end
+    -- Adjust only parent directory to correctly compute target
+    if diff.to ~= nil then diff.to = diff.to:gsub(from_dir_pattern, to_dir) end
+  end
 end
 
 -- Validators -----------------------------------------------------------------
@@ -2701,10 +2761,7 @@ H.map = function(mode, lhs, rhs, opts)
   vim.keymap.set(mode, lhs, rhs, opts)
 end
 
-H.trigger_event = function(event_name, data)
-  if H.block_event_trigger[event_name] then return end
-  vim.api.nvim_exec_autocmds('User', { pattern = event_name, data = data })
-end
+H.trigger_event = function(event_name, data) vim.api.nvim_exec_autocmds('User', { pattern = event_name, data = data }) end
 
 H.is_valid_buf = function(buf_id) return type(buf_id) == 'number' and vim.api.nvim_buf_is_valid(buf_id) end
 
