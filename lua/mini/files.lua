@@ -20,6 +20,7 @@
 ---     - Filter/prefix/sort of file system entries.
 ---     - Mappings used for common explorer actions.
 ---     - UI options: whether to show preview of file/directory under cursor, etc.
+---     - Bookmarks for quicker navigation.
 ---
 --- What it doesn't do:
 --- - Try to be replacement of system file explorer. It is mostly designed to
@@ -157,6 +158,10 @@
 ---  |-------------|------|------------------------------------------------|
 ---  | Go out plus |  H   | Focus on parent directory plus extra action    |
 ---  |-------------|------|------------------------------------------------|
+---  | Go to mark  |  '   | Jump to bookmark (waits for single key id)     |
+---  |-------------|------|------------------------------------------------|
+---  | Set mark    |  m   | Set bookmark (waits for single key id)         |
+---  |-------------|------|------------------------------------------------|
 ---  | Reset       | <BS> | Reset current explorer                         |
 ---  |-------------|------|------------------------------------------------|
 ---  | Reveal cwd  |  @   | Reset current current working directory        |
@@ -181,6 +186,11 @@
 ---
 --- - "Go out plus" is regular "Go out" but trims right part of branch.
 ---
+--- - "Set mark" and "Go to mark" both wait for user to press a single character
+---   of a bookmark id. Example: `ma` sets directory path of focused window as
+---   bookmark "a"; `'a` jumps (sets as whole branch) to bookmark "a".
+---   Special bookmark "'" always points to path before the latest bookmark jump.
+---
 --- - "Reset" focuses only on "anchor" directory (the one used to open current
 ---   explorer) and resets all stored directory cursor positions.
 ---
@@ -188,7 +198,7 @@
 ---   If it is not an ancestor of the current branch, nothing is done.
 ---
 --- - "Show help" results into new window with helpful information about current
----   explorer. Press `q` to close it.
+---   explorer (like buffer mappings and bookmarks). Press `q` to close it.
 ---
 --- - "Synchronize" parses user edits in directory buffers, applies them (after
 ---   confirmation), and updates all directory buffers with the most relevant
@@ -457,18 +467,18 @@
 --- <
 --- # Create mappings to modify target window via split ~
 ---
---- Combine |MiniFiles.get_target_window()| and |MiniFiles.set_target_window()|: >lua
+--- Combine |MiniFiles.get_explorer_state()| and |MiniFiles.set_target_window()|: >lua
 ---
 ---   local map_split = function(buf_id, lhs, direction)
 ---     local rhs = function()
 ---       -- Make new window and set it as target
----       local new_target_window
----       vim.api.nvim_win_call(MiniFiles.get_target_window(), function()
+---       local cur_target = MiniFiles.get_explorer_state().target_window
+---       local new_target = vim.api.nvim_win_call(cur_target, function()
 ---         vim.cmd(direction .. ' split')
----         new_target_window = vim.api.nvim_get_current_win()
+---         return vim.api.nvim_get_current_win()
 ---       end)
 ---
----       MiniFiles.set_target_window(new_target_window)
+---       MiniFiles.set_target_window(new_target)
 ---     end
 ---
 ---     -- Adding `desc` will result into `show_help` entries
@@ -481,8 +491,8 @@
 ---     callback = function(args)
 ---       local buf_id = args.data.buf_id
 ---       -- Tweak keys to your liking
----       map_split(buf_id, 'gs', 'belowright horizontal')
----       map_split(buf_id, 'gv', 'belowright vertical')
+---       map_split(buf_id, '<C-s>', 'belowright horizontal')
+---       map_split(buf_id, '<C-v>', 'belowright vertical')
 ---     end,
 ---   })
 --- <
@@ -501,6 +511,22 @@
 ---     pattern = 'MiniFilesBufferCreate',
 ---     callback = function(args)
 ---       vim.keymap.set('n', 'g~', files_set_cwd, { buffer = args.data.buf_id })
+---     end,
+---   })
+--- <
+--- # Set custom bookmarks ~
+---
+--- Use |MiniFiles.set_bookmark()| inside `MiniFilesExplorerOpen` event: >lua
+---
+---   local set_mark = function(id, path, desc)
+---     MiniFiles.set_bookmark(id, path, { desc = desc })
+---   end
+---   vim.api.nvim_create_autocmd('User', {
+---     pattern = 'MiniFilesExplorerOpen',
+---     callback = function()
+---       set_mark('c', vim.fn.stdpath('config'), 'Config') -- path
+---       set_mark('w', vim.fn.getcwd, 'Working directory') -- callable
+---       set_mark('~', '~', 'Home directory')
 ---     end,
 ---   })
 --- <
@@ -644,6 +670,8 @@ MiniFiles.config = {
     go_in_plus  = 'L',
     go_out      = 'h',
     go_out_plus = 'H',
+    mark_goto   = "'",
+    mark_set    = 'm',
     reset       = '<BS>',
     reveal_cwd  = '@',
     show_help   = 'g?',
@@ -943,25 +971,18 @@ end
 --- - Prepend branch with parent paths until current working directory is reached.
 ---   Do nothing if not inside it.
 MiniFiles.reveal_cwd = function()
-  local explorer = H.explorer_get()
-  if explorer == nil then return end
+  local state = MiniFiles.get_explorer_state()
+  if state == nil then return end
+  local branch, depth_focus = state.branch, state.depth_focus
 
   local cwd = H.fs_full_path(vim.fn.getcwd())
   local cwd_ancestor_pattern = string.format('^%s/.', vim.pesc(cwd))
-  while explorer.branch[1]:find(cwd_ancestor_pattern) ~= nil do
-    -- Add parent to branch
-    local parent, name = H.fs_get_parent(explorer.branch[1]), H.fs_get_basename(explorer.branch[1])
-    table.insert(explorer.branch, 1, parent)
-
-    explorer.depth_focus = explorer.depth_focus + 1
-
-    -- Set cursor on child entry
-    local parent_view = explorer.views[parent] or {}
-    parent_view.cursor = name
-    explorer.views[parent] = parent_view
+  while branch[1]:find(cwd_ancestor_pattern) ~= nil do
+    table.insert(branch, 1, H.fs_get_parent(branch[1]))
+    depth_focus = depth_focus + 1
   end
 
-  H.explorer_refresh(explorer)
+  MiniFiles.set_branch(branch, { depth_focus = depth_focus })
 end
 
 --- Show help window
@@ -975,7 +996,7 @@ MiniFiles.show_help = function()
   local buf_id = vim.api.nvim_get_current_buf()
   if not H.is_opened_buffer(buf_id) then return end
 
-  H.explorer_show_help(buf_id, vim.api.nvim_get_current_win())
+  H.explorer_show_help(explorer, buf_id, vim.api.nvim_get_current_win())
 end
 
 --- Get file system entry data
@@ -997,16 +1018,56 @@ MiniFiles.get_fs_entry = function(buf_id, line)
   return H.get_fs_entry_from_path_index(path_id)
 end
 
---- Get target window
+--- Get state of active explorer
 ---
----@return number|nil Window identifier inside which file will be opened or
----   `nil` if no explorer is opened.
-MiniFiles.get_target_window = function()
+---@return table|nil Table with explorer state data or `nil` if no active explorer.
+---   State data is a table with the following fields:
+---   - <anchor> `(string)` - anchor directory path (see |MiniFiles.open()|).
+---   - <bookmarks> `(table)` - map from bookmark id (single character) to its data:
+---     table with <path> and <desc> fields (see |MiniFiles.set_bookmark()|).
+---   - <branch> `(table)` - array of nested paths for currently opened branch.
+---   - <depth_focus> `(number)` - an index in <branch> for currently focused path.
+---   - <target_window> `(number)` - identifier of target window.
+---   - <windows> `(table)` - array with data about currently opened windows.
+---     Each element is a table with <win_id> (window identifier) and <path> (path
+---     shown in the window) fields.
+---
+---@seealso - |MiniFiles.set_bookmark()|
+--- - |MiniFiles.set_branch()|
+--- - |MiniFiles.set_target_window()|
+MiniFiles.get_explorer_state = function()
   local explorer = H.explorer_get()
   if explorer == nil then return end
 
-  explorer = H.explorer_ensure_target_window(explorer)
-  return explorer.target_window
+  H.explorer_ensure_target_window(explorer)
+  local windows = {}
+  for _, win_id in ipairs(explorer.windows) do
+    local buf_id = vim.api.nvim_win_get_buf(win_id)
+    local path = (H.opened_buffers[buf_id] or {}).path
+    table.insert(windows, { win_id = win_id, path = path })
+  end
+
+  return {
+    anchor = explorer.anchor,
+    bookmarks = vim.deepcopy(explorer.bookmarks),
+    branch = vim.deepcopy(explorer.branch),
+    depth_focus = explorer.depth_focus,
+    target_window = explorer.target_window,
+    windows = windows,
+  }
+end
+
+--- Get target window
+---
+--- Deprecated. Use |MiniFiles.get_explorer_state()|.
+MiniFiles.get_target_window = function()
+  -- TODO: remove after 'mini.nvim' 0.14 release
+  H.notify(
+    "`get_target_window()` is soft deprecated (currently works but will be removed after next 'mini.nvim' release)."
+      .. ' Use `get_explorer_state().target_window` instead. Sorry for the inconvenience.',
+    'WARN'
+  )
+  return (MiniFiles.get_explorer_state() or {}).target_window
 end
 
 --- Set target window
@@ -1019,6 +1080,70 @@ MiniFiles.set_target_window = function(win_id)
   if explorer == nil then return end
 
   explorer.target_window = win_id
+end
+
+--- Set branch
+---
+--- Set which paths to display. Preview (if enabled) is applied afterwards.
+---
+---@param branch table Array of strings representing actually present on disk paths.
+---   Each consecutive pair should represent direct parent-child paths.
+---   Should contain at least one directory path.
+---   May end with file path (will be previwed).
+---   Relative paths are resolved using |current-directory|.
+---@param opts table|nil Options. Possible fields:
+---   - <depth_focus> `(number)` - an index in `branch` for path to focus. Will
+---     be normalized to fit inside `branch`. Default: index of deepest directory.
+---
+---@seealso |MiniFiles.get_explorer_state()|
+MiniFiles.set_branch = function(branch, opts)
+  local explorer = H.explorer_get()
+  if explorer == nil then return end
+
+  -- Validate and normalize input
+  branch = H.validate_branch(branch)
+  opts = opts or {}
+  local depth_focus = opts.depth_focus or math.huge
+  if type(depth_focus) ~= 'number' then H.error('`depth_focus` should be a number') end
+  local max_depth = #branch - (H.fs_get_type(branch[#branch]) == 'file' and 1 or 0)
+  depth_focus = math.min(math.max(math.floor(depth_focus), 1), max_depth)
+
+  -- Set data and ensure cursors are on child entries
+  explorer.branch, explorer.depth_focus = branch, depth_focus
+  for i = 1, #branch - 1 do
+    local parent, child = branch[i], H.fs_get_basename(branch[i + 1])
+    local parent_view = explorer.views[parent] or {}
+    parent_view.cursor = child
+    explorer.views[parent] = parent_view
+  end
+
+  -- Skip update cursors, as they are already set
+  H.explorer_refresh(explorer, { skip_update_cursor = true })
+  -- Refresh second time to ensure that preview is shown. Doing that in other
+  -- way is not really feasible, as it requires knowing cursor at deepest path,
+  -- which might not yet be set before first refresh.
+  H.explorer_refresh(explorer)
+end
+
+--- Set bookmark
+---
+---@param id string Single character bookmark id.
+---@param path string|function Path of a present on disk directory to set as
+---   a bookmark's path. If callable, should return such path.
+---@param opts table|nil Options. Possible fields:
+---   - <desc> `(string)` - bookmark description (used in help window).
+MiniFiles.set_bookmark = function(id, path, opts)
+  local explorer = H.explorer_get()
+  if explorer == nil then return end
+
+  if not (type(id) == 'string' and id:len() == 1) then H.error('Bookmark id should be single character') end
+  local is_valid_path = vim.is_callable(path)
+    or (type(path) == 'string' and H.fs_get_type(vim.fn.expand(path)) == 'directory')
+  if not is_valid_path then H.error('Bookmark path should be a valid path to directory or a callable.') end
+  opts = opts or {}
+  if not (opts.desc == nil or type(opts.desc) == 'string') then H.error('Bookmark description should be string') end
+
+  explorer.bookmarks[id] = { path = path, desc = opts.desc }
 end
 
 --- Get latest used anchor path
@@ -1203,6 +1328,8 @@ H.setup_config = function(config)
     ['mappings.go_in_plus'] = { config.mappings.go_in_plus, 'string' },
     ['mappings.go_out'] = { config.mappings.go_out, 'string' },
     ['mappings.go_out_plus'] = { config.mappings.go_out_plus, 'string' },
+    ['mappings.mark_goto'] = { config.mappings.mark_goto, 'string' },
+    ['mappings.mark_set'] = { config.mappings.mark_set, 'string' },
     ['mappings.reset'] = { config.mappings.reset, 'string' },
     ['mappings.reveal_cwd'] = { config.mappings.reveal_cwd, 'string' },
     ['mappings.show_help'] = { config.mappings.show_help, 'string' },
@@ -1228,13 +1355,11 @@ end
 H.apply_config = function(config) MiniFiles.config = config end
 
 H.create_autocommands = function(config)
-  local augroup = vim.api.nvim_create_augroup('MiniFiles', {})
+  local gr = vim.api.nvim_create_augroup('MiniFiles', {})
 
   local au = function(event, pattern, callback, desc)
-    vim.api.nvim_create_autocmd(event, { group = augroup, pattern = pattern, callback = callback, desc = desc })
+    vim.api.nvim_create_autocmd(event, { group = gr, pattern = pattern, callback = callback, desc = desc })
   end
-
-  au('VimResized', '*', MiniFiles.refresh, 'Refresh on resize')
 
   if config.options.use_as_default_explorer then
     -- Stop 'netrw' from showing. Needs `VimEnter` event autocommand if
@@ -1244,6 +1369,9 @@ H.create_autocommands = function(config)
 
     au('BufEnter', '*', H.track_dir_edit, 'Track directory edit')
   end
+
+  au('VimResized', '*', MiniFiles.refresh, 'Refresh on resize')
+  au('ColorScheme', '*', H.create_default_hl, 'Ensure colors')
 end
 
 --stylua: ignore
@@ -1302,6 +1430,8 @@ end
 -- Explorers ------------------------------------------------------------------
 ---@class Explorer
 ---
+---@field bookmarks table Map from single characters to bookmark data: table
+---   with <path> and <desc> fields.
 ---@field branch table Array of absolute directory paths from parent to child.
 ---   Its ids are called depth.
 ---@field depth_focus number Depth to focus.
@@ -1327,6 +1457,7 @@ H.explorer_new = function(path)
     windows = {},
     anchor = path,
     target_window = vim.api.nvim_get_current_win(),
+    bookmarks = {},
     opts = {},
   }
 end
@@ -1785,7 +1916,7 @@ H.explorer_trim_branch_left = function(explorer)
   return explorer
 end
 
-H.explorer_show_help = function(explorer_buf_id, explorer_win_id)
+H.explorer_show_help = function(explorer, explorer_buf_id, explorer_win_id)
   -- Compute lines
   local buf_mappings = vim.api.nvim_buf_get_keymap(explorer_buf_id, 'n')
   local map_data, desc_width = {}, 0
@@ -1805,6 +1936,20 @@ H.explorer_show_help = function(explorer_buf_id, explorer_win_id)
     table.insert(lines, string.format(map_format, desc, map_data[desc]))
   end
   table.insert(lines, '')
+
+  local bookmark_ids = vim.tbl_keys(explorer.bookmarks)
+  if #bookmark_ids > 0 then
+    table.insert(lines, 'Bookmarks:')
+    table.insert(lines, '')
+    table.sort(bookmark_ids)
+    for _, id in ipairs(bookmark_ids) do
+      local data = explorer.bookmarks[id]
+      local desc = data.desc or (vim.is_callable(data.path) and data.path() or data.path)
+      table.insert(lines, id .. ' │ ' .. desc)
+    end
+    table.insert(lines, '')
+  end
+
   table.insert(lines, '(Press `q` to close)')
 
   -- Create buffer
@@ -2071,6 +2216,30 @@ H.buffer_make_mappings = function(buf_id, mappings)
     return [[<C-\><C-n>]]
   end
 
+  local mark_goto = function()
+    local id = H.getcharstr()
+    if id == nil then return end
+    local data = MiniFiles.get_explorer_state().bookmarks[id]
+    if data == nil then return H.notify('No bookmark with id ' .. vim.inspect(id), 'WARN') end
+
+    local path = data.path
+    if vim.is_callable(path) then path = path() end
+    local is_valid_path = type(path) == 'string' and H.fs_get_type(vim.fn.expand(path)) == 'directory'
+    if not is_valid_path then return H.notify('Bookmark path should be a valid path to directory', 'WARN') end
+
+    local state = MiniFiles.get_explorer_state()
+    MiniFiles.set_bookmark("'", state.branch[state.depth_focus], { desc = 'Before latest jump' })
+    MiniFiles.set_branch({ path })
+  end
+
+  local mark_set = function()
+    local id = H.getcharstr()
+    if id == nil then return end
+    local state = MiniFiles.get_explorer_state()
+    MiniFiles.set_bookmark(id, state.branch[state.depth_focus])
+    H.notify('Bookmark ' .. vim.inspect(id) .. ' is set', 'INFO')
+  end
+
   local buf_map = function(mode, lhs, rhs, desc)
     -- Use `nowait` to account for non-buffer mappings starting with `lhs`
     H.map(mode, lhs, rhs, { buffer = buf_id, desc = desc, nowait = true })
@@ -2082,6 +2251,8 @@ H.buffer_make_mappings = function(buf_id, mappings)
   buf_map('n', mappings.go_in_plus,  go_in_plus,            'Go in entry plus')
   buf_map('n', mappings.go_out,      go_out_with_count,     'Go out of directory')
   buf_map('n', mappings.go_out_plus, go_out_plus,           'Go out of directory plus')
+  buf_map('n', mappings.mark_goto,   mark_goto,             'Go to bookmark')
+  buf_map('n', mappings.mark_set,    mark_set,              'Set bookmark')
   buf_map('n', mappings.reset,       MiniFiles.reset,       'Reset')
   buf_map('n', mappings.reveal_cwd,  MiniFiles.reveal_cwd,  'Reveal cwd')
   buf_map('n', mappings.show_help,   MiniFiles.show_help,   'Show Help')
@@ -2756,6 +2927,25 @@ H.validate_line = function(buf_id, x)
   return x
 end
 
+H.validate_branch = function(x)
+  if not (H.islist(x) and x[1] ~= nil) then H.error('`branch` should be array with at least one element') end
+  local res = {}
+  for i, p in ipairs(x) do
+    if type(p) ~= 'string' then H.error('`branch` contains not string: ' .. vim.inspect(p)) end
+    p = H.fs_full_path(p)
+    if not H.fs_is_present_path(p) then H.error('`branch` contains not present path: ' .. vim.inspect(p)) end
+    res[i] = p
+  end
+  for i = 2, #res do
+    local parent, child = res[i - 1], res[i]
+    if (parent .. '/' .. child:match('[^/]+$')) ~= res[i] then
+      H.error('`branch` contains not a parent-child pair: ' .. vim.inspect(parent) .. ' and ' .. vim.inspect(child))
+    end
+  end
+  if #res == 1 and H.fs_get_type(res[1]) == 'file' then H.error('`branch` should contain at least one directory') end
+  return res
+end
+
 -- Utilities ------------------------------------------------------------------
 H.error = function(msg) error(string.format('(mini.files) %s', msg), 0) end
 
@@ -2795,5 +2985,14 @@ H.get_first_valid_normal_window = function()
     if vim.api.nvim_win_get_config(win_id).relative == '' then return win_id end
   end
 end
+
+H.getcharstr = function()
+  local ok, char = pcall(vim.fn.getcharstr)
+  if not ok or char == '\27' or char == '' then return end
+  return char
+end
+
+-- TODO: Remove after compatibility with Neovim=0.9 is dropped
+H.islist = vim.fn.has('nvim-0.10') == 1 and vim.islist or vim.tbl_islist
 
 return MiniFiles
