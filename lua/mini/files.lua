@@ -1811,6 +1811,7 @@ H.explorer_refresh_depth_window = function(explorer, depth, win_count, win_col)
     -- Use shortened full path in left most window
     title = win_count == 1 and H.fs_shorten_path(H.fs_full_path(path)) or H.fs_get_basename(path),
   }
+  config.title = H.escape_newline(config.title)
 
   -- Prepare and register window
   local win_id = windows[win_count]
@@ -2324,8 +2325,8 @@ H.buffer_update_directory = function(buf_id, path, opts, is_preview)
     if i <= n_computed_prefixes then
       prefix, hl = prefix_fun(entry)
     end
-    prefix, hl = prefix or '', hl or ''
-    table.insert(lines, string.format(line_format, H.path_index[entry.path], prefix, entry.name))
+    prefix, hl, name = prefix or '', hl or '', H.escape_newline(entry.name)
+    table.insert(lines, string.format(line_format, H.path_index[entry.path], prefix, name))
     table.insert(icon_hl, hl)
     table.insert(name_hl, entry.fs_type == 'directory' and 'MiniFilesDirectory' or 'MiniFilesFile')
   end
@@ -2413,7 +2414,7 @@ H.buffer_compute_fs_diff = function(buf_id)
     local path_to = H.fs_child_path(path, name_to) .. (vim.endswith(name_to, '/') and '/' or '')
 
     -- Ignore blank lines and already synced entries (even several user-copied)
-    if l:find('^%s*$') == nil and path_from ~= path_to then
+    if l:find('^%s*$') == nil and H.escape_newline(path_from) ~= H.escape_newline(path_to) then
       table.insert(res, { from = path_from, to = path_to, dir = path })
     elseif path_id ~= nil then
       present_path_ids[path_id] = true
@@ -2556,9 +2557,6 @@ H.window_update = function(win_id, config)
   -- Reset basic highlighting (removes possible "focused" highlight group)
   H.window_update_highlight(win_id, 'FloatTitle', 'MiniFilesTitle')
 
-  -- Make sure that 'cursorline' is not overridden by `config.style`
-  vim.wo[win_id].cursorline = true
-
   -- Make sure proper `conceallevel` (can be not the case with 'noice.nvim')
   vim.wo[win_id].conceallevel = 3
 end
@@ -2586,17 +2584,16 @@ end
 
 H.window_set_view = function(win_id, view)
   -- Set buffer
-  local buf_id = view.buf_id
+  local buf_id, buf_data = view.buf_id, H.opened_buffers[view.buf_id]
   H.win_set_buf(win_id, buf_id)
   -- - Update buffer register. No need to update previous buffer data, as it
   --   should already be invalidated.
-  H.opened_buffers[buf_id].win_id = win_id
+  buf_data.win_id = win_id
 
-  -- Set cursor
+  -- Set cursor (if defined), visible only in directories
   pcall(H.window_set_cursor, win_id, view.cursor)
-
-  -- Set 'cursorline' here also because changing buffer might have removed it
-  vim.wo[win_id].cursorline = true
+  -- NOTE: set 'cursorline' here because changing buffer might remove it
+  vim.wo[win_id].cursorline = H.fs_get_type(buf_data.path) == 'directory'
 
   -- Update border highlight based on buffer status
   H.window_update_border_hl(win_id)
@@ -2786,7 +2783,7 @@ H.fs_actions_to_lines = function(fs_actions)
 
     -- Add to per directory lines
     local dir_actions = actions_per_dir[dir] or {}
-    table.insert(dir_actions, '  ' .. l)
+    table.insert(dir_actions, '  ' .. H.escape_newline(l))
     actions_per_dir[dir] = dir_actions
   end
 
@@ -3008,6 +3005,8 @@ H.getcharstr = function()
   if not ok or char == '\27' or char == '' then return end
   return char
 end
+
+H.escape_newline = function(x) return ((x or ''):gsub('\n', '<NL>')) end
 
 -- TODO: Remove after compatibility with Neovim=0.9 is dropped
 H.islist = vim.fn.has('nvim-0.10') == 1 and vim.islist or vim.tbl_islist
