@@ -563,6 +563,15 @@ local H = {}
 ---   require('mini.files').setup({}) -- replace {} with your config table
 --- <
 MiniFiles.setup = function(config)
+  -- TODO: Remove after Neovim=0.9 support is dropped
+  if vim.fn.has('nvim-0.10') == 0 then
+    vim.notify(
+      '(mini.files) Neovim<0.10 is soft deprecated (module works but is not supported).'
+        .. " It will be deprecated after the next 'mini.nvim' release (module might not work)."
+        .. ' Please update your Neovim version.'
+    )
+  end
+
   -- Export module
   _G.MiniFiles = MiniFiles
 
@@ -2596,6 +2605,12 @@ H.window_set_view = function(win_id, view)
   local culopt = vim.wo[win_id].cursorlineopt
   if culopt:find('line') == nil then vim.wo[win_id].cursorlineopt = culopt .. ',line' end
 
+  -- Respect global 'list' option, as it is disabled in floating windows
+  -- TODO: Use vim.wo[win_id][0] after compatibility with Neovim=0.9 is dropped
+  local opts_scope = { scope = 'local', win = win_id }
+  vim.api.nvim_set_option_value('list', vim.go.list, opts_scope)
+  vim.api.nvim_set_option_value('listchars', vim.go.listchars, opts_scope)
+
   -- Update border highlight based on buffer status
   H.window_update_border_hl(win_id)
 end
@@ -2714,7 +2729,9 @@ end
 
 H.fs_normalize_path = function(path) return (path:gsub('/+', '/'):gsub('(.)/$', '%1')) end
 if H.is_windows then
-  H.fs_normalize_path = function(path) return (path:gsub('\\', '/'):gsub('([^/])/+', '%1/'):gsub('(.)[\\/]$', '%1')) end
+  H.fs_normalize_path = function(path)
+    return (path:gsub('\\', '/'):gsub('([^/:])/+', '%1/'):gsub('([^:])/+$', '%1'):gsub('^(%a):/+([^/])', '%1://%2'))
+  end
 end
 
 H.fs_is_imaginary_path = function(path) return path:sub(-1) == '\000' end
@@ -2730,6 +2747,15 @@ H.fs_shorten_path = function(path)
   path = H.fs_normalize_path(path)
   local home_dir = H.fs_normalize_path(vim.loop.os_homedir() or '~')
   return (path:gsub('^' .. vim.pesc(home_dir), '~'))
+end
+
+H.fs_relcwd_path = function(path) return vim.fn.fnamemodify(path, ':.') end
+if H.is_windows then
+  -- Make manually because `C://dir/file` paths conflict with `C:/dir` cwd path
+  H.fs_relcwd_path = function(path)
+    local cwd = H.fs_normalize_path(vim.fn.getcwd())
+    return (H.fs_normalize_path(path):gsub('^' .. vim.pesc(cwd) .. '/', ''))
+  end
 end
 
 H.fs_get_basename = function(path) return H.fs_normalize_path(path):match('[^/]+$') end
@@ -2907,7 +2933,7 @@ H.rename_loaded_buffer = function(buf_id, from, to)
   if cur_name == new_name then return end
 
   -- Rename buffer using relative form (for nicer `:buffers` output)
-  vim.api.nvim_buf_set_name(buf_id, vim.fn.fnamemodify(new_name, ':.'))
+  vim.api.nvim_buf_set_name(buf_id, H.fs_relcwd_path(new_name))
 
   -- Force write to avoid the 'overwrite existing file' error message on write
   -- for normal files
@@ -2987,7 +3013,7 @@ H.edit = function(path, win_id)
   local b = vim.api.nvim_win_get_buf(win_id or 0)
   local try_mimic_buf_reuse = (vim.fn.bufname(b) == '' and vim.bo[b].buftype ~= 'quickfix' and not vim.bo[b].modified)
     and (#vim.fn.win_findbuf(b) == 1 and vim.deep_equal(vim.fn.getbufline(b, 1, '$'), { '' }))
-  local buf_id = vim.fn.bufadd(vim.fn.fnamemodify(path, ':.'))
+  local buf_id = vim.fn.bufadd(H.fs_relcwd_path(path))
   -- Showing in window also loads. Use `pcall` to not error with swap messages.
   pcall(vim.api.nvim_win_set_buf, win_id or 0, buf_id)
   vim.bo[buf_id].buflisted = true
@@ -3018,7 +3044,10 @@ H.set_extmark = function(...) pcall(vim.api.nvim_buf_set_extmark, ...) end
 
 H.win_set_buf = function(win_id, buf_id)
   vim.wo[win_id].winfixbuf = false
-  vim.api.nvim_win_set_buf(win_id, buf_id)
+  -- Prevent `BufEnter,BufLeave` that come from `nvim_win_set_buf` and conflict
+  -- with other modules (like 'mini.jump'). Use 'mini.files' events if needed.
+  local cmd = string.format('noautocmd call nvim_win_set_buf(%d, %d)', win_id, buf_id)
+  vim.cmd(cmd)
   vim.wo[win_id].winfixbuf = true
 end
 if vim.fn.has('nvim-0.10') == 0 then H.win_set_buf = vim.api.nvim_win_set_buf end
