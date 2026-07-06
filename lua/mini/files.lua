@@ -1836,7 +1836,7 @@ H.explorer_compute_fs_actions = function(explorer)
   local trash_dir = H.fs_child_path(vim.fn.stdpath('data'), 'mini.files/trash')
   for p, _ in pairs(delete_map) do
     local to = is_trash and H.fs_child_path(trash_dir, H.fs_get_basename(p)) or nil
-    table.insert(delete, { action = 'delete', from = p, to = to })
+    table.insert(delete, { action = 'delete', from = p, fs_type = H.fs_get_type(p), to = to })
   end
 
   -- Construct final array with proper order of actions:
@@ -1855,6 +1855,10 @@ H.explorer_compute_fs_actions = function(explorer)
         local to_is_affected = vim.startswith(diff.to, del_from_dir) and diff.to ~= del_from_dir
         will_be_deleted = will_be_deleted or from_is_affected or to_is_affected
       end
+
+      -- Pre-compute file system type of operation as it is harder to compute
+      -- later. This info is useful for LSP hooks.
+      diff.fs_type = H.fs_get_type(diff.from) or (vim.endswith(diff.to or '', '/') and 'directory' or 'file')
       table.insert(will_be_deleted and before_delete or after_delete, diff)
     end
   end
@@ -2834,7 +2838,7 @@ end
 H.fs_is_windows_top = function(path) return H.is_windows and path:find('^%w:[\\/]?$') ~= nil end
 
 H.fs_get_type = function(path)
-  if not (not H.fs_is_imaginary_path(path) and H.fs_is_present_path(path)) then return nil end
+  if path == nil or not (not H.fs_is_imaginary_path(path) and H.fs_is_present_path(path)) then return nil end
   return vim.fn.isdirectory(path) == 1 and 'directory' or 'file'
 end
 
@@ -2918,7 +2922,7 @@ H.lsp_fs_hook = function(method, diffs, lsp_timeout)
   -- https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#createFilesParams
   -- https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#deleteFilesParams
   -- https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#renameFilesParams
-  local files, to_uri = {}, vim.uri_from_fname
+  local files, to_uri = {}, H.fname_to_uri
   local needs_check = method == 'willCreate' or method == 'willRename'
   local is_create, is_delete, is_rename =
     vim.endswith(method, 'Create'), vim.endswith(method, 'Delete'), vim.endswith(method, 'Rename')
@@ -2928,8 +2932,8 @@ H.lsp_fs_hook = function(method, diffs, lsp_timeout)
     if is_delete and d.action == 'delete' then file = { uri = to_uri(d.from) } end
     if is_rename and d.action == 'rename' then file = { oldUri = to_uri(d.from), newUri = to_uri(d.to) } end
 
-    -- Precompute LSP file type for filters (path can be not yet on disk)
-    file.fs_type = (d.from or d.to):find('/$') ~= nil and 'folder' or 'file'
+    -- Pass file system type according to the LSP spec
+    file.fs_type = d.fs_type == 'directory' and 'folder' or 'file'
 
     -- Some actions might not succeed, so make best effort check before that
     local pass_check = not needs_check or (needs_check and d.to ~= nil and not H.fs_is_present_path(d.to))
@@ -2952,12 +2956,10 @@ H.lsp_fs_hook_client = function(client, full_method, lsp_files, timeout)
   local is_fs_type = function(lsp_file, ref_fs_type) return ref_fs_type == nil or ref_fs_type == lsp_file.fs_type end
   local make_filter = function(scheme, ref_fs_type, glob, ignore_case)
     local adjust_case = ignore_case and vim.fn.tolower or function(x) return x end
-    -- On Windows `uri_to_fname` forces `\`, but forcing / seems more robust
-    local to_fname = H.is_windows and function(x) return (vim.uri_to_fname(x):gsub('\\', '/')) end or vim.uri_to_fname
     local glob_lpeg = vim.glob.to_lpeg(adjust_case(glob) or '**')
     return function(lsp_file)
       local uri = lsp_file.uri or lsp_file.oldUri
-      local fname = adjust_case(to_fname(uri))
+      local fname = adjust_case(H.uri_to_fname(uri))
       return is_scheme(uri, scheme) and is_fs_type(lsp_file, ref_fs_type) and glob_lpeg:match(fname) ~= nil
     end
   end
@@ -3109,6 +3111,16 @@ H.adjust_after_move = function(from, to, fs_actions, start_ind)
     -- Adjust only parent directory to correctly compute target
     if diff.to ~= nil then diff.to = diff.to:gsub(from_dir_pattern, to_dir) end
   end
+end
+
+H.uri_to_fname = vim.uri_to_fname
+H.fname_to_uri = vim.uri_from_fname
+if H.is_windows then
+  -- On Windows `uri_to_fname` forces `\`, but forcing `/` seems more robust
+  H.uri_to_fname = function(x) return (vim.uri_to_fname(x):gsub('\\', '/')) end
+  -- On Windows paths like `C://...` have issues with glob matching and some
+  -- LSP implementations. Force `C:/` instead.
+  H.fname_to_uri = function(x) return vim.uri_from_fname((x:gsub('^(%a)://([^/])', '%1:/%2'))) end
 end
 
 -- Validators -----------------------------------------------------------------
