@@ -384,7 +384,7 @@
 --- Use a combination of |MiniFiles.open()| and |MiniFiles.close()|: >lua
 ---
 ---   local minifiles_toggle = function(...)
----     if not MiniFiles.close() then MiniFiles.open(...) end
+---     if MiniFiles.close() == nil then MiniFiles.open(...) end
 ---   end
 --- <
 --- # Customize windows ~
@@ -899,7 +899,7 @@ end
 ---@return boolean|nil Whether closing was done or `nil` if there was nothing to close.
 MiniFiles.close = function()
   -- Stop possible tracking lost focus
-  pcall(vim.loop.timer_stop, H.timers.focus)
+  pcall(vim.uv.timer_stop, H.timers.focus)
 
   -- Act if there is explorer to close (even invisible after improper quit)
   local explorer = H.explorer_get(nil, true)
@@ -1329,7 +1329,7 @@ H.ns_id = {
 
 -- Timers
 H.timers = {
-  focus = vim.loop.new_timer(),
+  focus = vim.uv.new_timer(),
 }
 
 -- Index of all visited files
@@ -1358,7 +1358,7 @@ H.opened_buffers = {}
 H.vim_ui = { select = nil, select_active = false, input = nil, input_active = false }
 
 -- File system information
-H.is_windows = vim.loop.os_uname().sysname == 'Windows_NT'
+H.is_windows = vim.uv.os_uname().sysname == 'Windows_NT'
 
 -- Helper functionality =======================================================
 -- Settings -------------------------------------------------------------------
@@ -1466,8 +1466,8 @@ end
 
 -- Autocommands ---------------------------------------------------------------
 H.track_dir_edit = function(data)
-  -- Make early returns
-  if vim.api.nvim_get_current_buf() ~= data.buf then return end
+  -- Open explorer only on intentional directory edit (not in a script)
+  if vim.api.nvim_get_current_buf() ~= data.buf or vim.wo.diff then return end
 
   if vim.b.minifiles_processed_dir then
     -- Smartly delete directory buffer if already visited
@@ -1483,12 +1483,17 @@ H.track_dir_edit = function(data)
   local path = vim.api.nvim_buf_get_name(0)
   if vim.fn.isdirectory(path) ~= 1 then return end
 
-  -- Make directory buffer disappear when it is not needed
-  vim.bo.bufhidden = 'wipe'
-  vim.b.minifiles_processed_dir = true
+  -- Delay opening to not act if the buffer was opened temporarily in a script
+  vim.schedule(function()
+    if vim.api.nvim_get_current_buf() ~= data.buf or vim.wo.diff then return end
 
-  -- Open directory without history
-  vim.schedule(function() MiniFiles.open(path, false) end)
+    -- Make directory buffer disappear when it is not needed
+    vim.bo.bufhidden = 'wipe'
+    vim.b.minifiles_processed_dir = true
+
+    -- Open directory without history
+    MiniFiles.open(path, false)
+  end)
 end
 
 -- Explorers ------------------------------------------------------------------
@@ -2033,8 +2038,10 @@ H.explorer_show_help = function(explorer, explorer_buf_id, explorer_win_id)
 
   -- Create buffer
   local buf_id = vim.api.nvim_create_buf(false, true)
-  H.set_buflines(buf_id, lines)
   H.set_buf_name(buf_id, 'help')
+  vim.bo[buf_id].modifiable = true
+  H.set_buflines(buf_id, lines)
+  vim.bo[buf_id].modifiable = false
 
   vim.keymap.set('n', 'q', '<Cmd>close<CR>', { buffer = buf_id, desc = 'Close this window' })
 
@@ -2233,6 +2240,7 @@ H.buffer_create = function(path, mappings)
   -- Create buffer
   local buf_id = vim.api.nvim_create_buf(false, true)
   H.set_buf_name(buf_id, path)
+  vim.bo[buf_id].modifiable = true
 
   -- Register buffer
   H.opened_buffers[buf_id] = { path = path }
@@ -2423,7 +2431,7 @@ H.buffer_update_directory = function(buf_id, path, opts, is_preview)
     local icon_start, name_start = l:match('^/%d+/().-()/')
 
     -- NOTE: Use `right_gravity = false` for persistent highlights during edit
-    local icon_opts = { hl_group = icon_hl[i], end_col = name_start - 1, right_gravity = false }
+    local icon_opts = { hl_group = icon_hl[i], end_col = name_start - 1, right_gravity = false, priority = 101 }
     set_hl(i - 1, icon_start - 1, icon_opts)
 
     local name_opts = {
@@ -2431,6 +2439,7 @@ H.buffer_update_directory = function(buf_id, path, opts, is_preview)
       end_row = i,
       end_col = 0,
       right_gravity = false,
+      priority = 102,
       virt_text = { { MiniFiles.config.content.sort_label and (MiniFiles.config.content.sort == MiniFiles.size_sort and (fs_entries[i].fs_type ~= 'directory' and H.bytes_to_size(fs_entries[i].size) or '') or (MiniFiles.config.content.sort == MiniFiles.time_sort and os.date("%d-%m-%y %H:%M", fs_entries[i].mtime) or '')) or '', "MiniFilesTitle" } },
       virt_text_pos = "right_align",
     }
@@ -2441,10 +2450,10 @@ end
 H.buffer_update_file = function(buf_id, path, opts, _)
   -- Work only with readable text file. This is not 100% proof, but good enough.
   -- Source: https://github.com/sharkdp/content_inspector
-  local fd, width_preview = vim.loop.fs_open(path, 'r', 1), opts.windows.width_preview
+  local fd, width_preview = vim.uv.fs_open(path, 'r', 1), opts.windows.width_preview
   if fd == nil then return H.set_buflines(buf_id, { '-No-access' .. string.rep('-', width_preview) }) end
-  local is_text = vim.loop.fs_read(fd, 1024):find('\0') == nil
-  vim.loop.fs_close(fd)
+  local is_text = vim.uv.fs_read(fd, 1024):find('\0') == nil
+  vim.uv.fs_close(fd)
   if not is_text then return H.set_buflines(buf_id, { '-Non-text-file' .. string.rep('-', width_preview) }) end
 
   -- Compute lines. Limit number of read lines to work better on large files.
@@ -2657,9 +2666,13 @@ H.window_set_view = function(win_id, view)
   buf_data.win_id = win_id
 
   -- Set cursor (if defined), visible only in directories
-  pcall(H.window_set_cursor, win_id, view.cursor)
+  local ok_cursor = pcall(vim.api.nvim_win_set_cursor, win_id, view.cursor)
+  -- - Tweak cursor here, before `CursorMoved`, event to reduce flicker
+  local is_dir = H.fs_get_type(buf_data.path) == 'directory'
+  if ok_cursor and is_dir then pcall(H.window_tweak_cursor, win_id, buf_id) end
+
   -- NOTE: set 'cursorline[opt]' here because changing buffer might remove it
-  vim.wo[win_id].cursorline = H.fs_get_type(buf_data.path) == 'directory'
+  vim.wo[win_id].cursorline = is_dir
   local culopt = vim.wo[win_id].cursorlineopt
   if culopt:find('line') == nil then vim.wo[win_id].cursorlineopt = culopt .. ',line' end
 
@@ -2669,15 +2682,6 @@ H.window_set_view = function(win_id, view)
 
   -- Update border highlight based on buffer status
   H.window_update_border_hl(win_id)
-end
-
-H.window_set_cursor = function(win_id, cursor)
-  if type(cursor) ~= 'table' then return end
-
-  vim.api.nvim_win_set_cursor(win_id, cursor)
-
-  -- Tweak cursor here and don't rely on `CursorMoved` event to reduce flicker
-  H.window_tweak_cursor(win_id, vim.api.nvim_win_get_buf(win_id))
 end
 
 H.window_tweak_cursor = function(win_id, buf_id)
@@ -2718,24 +2722,24 @@ end
 ---@field path_id number Id of full path.
 ---@private
 H.fs_read_dir = function(path, content_opts)
-  local fs = vim.loop.fs_scandir(path)
+  local fs = vim.uv.fs_scandir(path)
   local res = {}
   if not fs then return res end
 
   -- Read all entries
-  local name, fs_type = vim.loop.fs_scandir_next(fs)
+  local name, fs_type = vim.uv.fs_scandir_next(fs)
   while name do
     if not (fs_type == 'file' or fs_type == 'directory') then fs_type = H.fs_get_type(H.fs_child_path(path, name)) end
     if content_opts.sort ~= MiniFiles.size_sort and content_opts.sort ~= MiniFiles.time_sort then
       table.insert(res, { fs_type = fs_type, name = name, path = H.fs_child_path(path, name) })
     else
       local child_path = H.fs_child_path(path, name)
-      local stats = vim.loop.fs_stat(child_path)
+      local stats = vim.uv.fs_stat(child_path)
       if stats then
         table.insert(res, { size = stats.size, mtime = stats.mtime.sec, fs_type = fs_type, name = name, path = child_path })
       end
     end
-    name, fs_type = vim.loop.fs_scandir_next(fs)
+    name, fs_type = vim.uv.fs_scandir_next(fs)
   end
 
   -- Filter and sort entries
@@ -2792,7 +2796,7 @@ end
 
 H.fs_is_imaginary_path = function(path) return path:sub(-1) == '\000' end
 
-H.fs_is_present_path = function(path) return vim.loop.fs_stat(path) ~= nil and not H.fs_is_imaginary_path(path) end
+H.fs_is_present_path = function(path) return vim.uv.fs_stat(path) ~= nil and not H.fs_is_imaginary_path(path) end
 
 H.fs_child_path = function(dir, name) return H.fs_normalize_path(string.format('%s/%s', dir, name)) end
 
@@ -2801,7 +2805,7 @@ H.fs_full_path = function(path) return H.fs_normalize_path(vim.fn.fnamemodify(pa
 H.fs_shorten_path = function(path)
   -- Replace home directory with '~'
   path = H.fs_normalize_path(path)
-  local home_dir = H.fs_normalize_path(vim.loop.os_homedir() or '~')
+  local home_dir = H.fs_normalize_path(vim.uv.os_homedir() or '~')
   return (path:gsub('^' .. vim.pesc(home_dir), '~'))
 end
 
@@ -3017,7 +3021,7 @@ H.fs_do.copy = function(from, to)
   vim.fn.mkdir(H.fs_get_parent(to), 'p')
 
   -- Copy file directly
-  if from_type == 'file' then return vim.loop.fs_copyfile(from, to) end
+  if from_type == 'file' then return vim.uv.fs_copyfile(from, to) end
 
   -- Recursively copy a directory
   local fs_entries = H.fs_read_dir(from, { filter = function() return true end, sort = function(x) return x end })
@@ -3048,7 +3052,7 @@ H.fs_do.move = function(from, to, skip_buf_rename)
 
   -- Move while allowing to create directory
   vim.fn.mkdir(H.fs_get_parent(to), 'p')
-  local success, _, err_code = vim.loop.fs_rename(from, to)
+  local success, _, err_code = vim.uv.fs_rename(from, to)
 
   if err_code == 'EXDEV' then
     -- Handle cross-device move separately as `loop.fs_rename` does not work
